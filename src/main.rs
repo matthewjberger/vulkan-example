@@ -146,7 +146,7 @@ impl winit::application::ApplicationHandler for Context {
 }
 
 struct Renderer {
-    pub entry: ash::Entry,
+    pub _entry: ash::Entry,
     pub instance: ash::Instance,
     pub surface: ash::khr::surface::Instance,
     pub surface_khr: vk::SurfaceKHR,
@@ -156,19 +156,24 @@ struct Renderer {
     pub device: ash::Device,
     pub present_queue_family_index: u32,
     pub graphics_queue_family_index: u32,
-    pub transfer_queue_family_index: Option<u32>,
+    pub _transfer_queue_family_index: Option<u32>,
     pub graphics_queue: vk::Queue,
     pub present_queue: vk::Queue,
-    pub transfer_queue: Option<vk::Queue>,
+    pub _transfer_queue: Option<vk::Queue>,
     pub command_pool: vk::CommandPool,
     pub allocator: Option<Arc<Mutex<gpu_allocator::vulkan::Allocator>>>,
     pub swapchain: Swapchain,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub command_buffers: Vec<vk::CommandBuffer>,
-    pub image_available_semaphore: vk::Semaphore,
-    pub render_finished_semaphore: vk::Semaphore,
-    pub in_flight_fence: vk::Fence,
+
+    pub image_available_semaphores: Vec<vk::Semaphore>,
+    pub render_finished_semaphores: Vec<vk::Semaphore>,
+    pub in_flight_fences: Vec<vk::Fence>,
+    pub images_in_flight: Vec<vk::Fence>,
+    pub current_frame: usize,
+    pub frames_in_flight: usize,
+
     pub is_swapchain_dirty: bool,
 
     pub egui_renderer: Option<egui_ash_renderer::Renderer>,
@@ -178,15 +183,21 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             self.egui_renderer = None;
+
+            for i in 0..self.frames_in_flight {
+                self.device.destroy_fence(self.in_flight_fences[i], None);
+                self.device
+                    .destroy_semaphore(self.image_available_semaphores[i], None);
+            }
+
+            for i in 0..self.render_finished_semaphores.len() {
+                self.device
+                    .destroy_semaphore(self.render_finished_semaphores[i], None);
+            }
+
             cleanup_swapchain(self);
 
             self.allocator = None;
-
-            self.device.destroy_fence(self.in_flight_fence, None);
-            self.device
-                .destroy_semaphore(self.image_available_semaphore, None);
-            self.device
-                .destroy_semaphore(self.render_finished_semaphore, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
@@ -205,7 +216,6 @@ struct Swapchain {
     pub format: vk::SurfaceFormatKHR,
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
-    pub depth_format: vk::Format,
 }
 
 fn create_renderer<W>(
@@ -275,19 +285,6 @@ where
     let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain)?;
     log::info!("Created render pipeline and layout");
 
-    let image_available_semaphore = {
-        let semaphore_info = vk::SemaphoreCreateInfo::default();
-        unsafe { device.create_semaphore(&semaphore_info, None)? }
-    };
-    let render_finished_semaphore = {
-        let semaphore_info = vk::SemaphoreCreateInfo::default();
-        unsafe { device.create_semaphore(&semaphore_info, None)? }
-    };
-    let fence = {
-        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        unsafe { device.create_fence(&fence_info, None)? }
-    };
-
     let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
         allocator.clone(),
         device.clone(),
@@ -301,8 +298,33 @@ where
         },
     )?;
 
+    const FRAMES_IN_FLIGHT: usize = 3;
+
+    let image_available_semaphores = {
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        (0..FRAMES_IN_FLIGHT)
+            .map(|_| unsafe { device.create_semaphore(&semaphore_info, None) })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let render_finished_semaphores = {
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        (0..swapchain.images.len())
+            .map(|_| unsafe { device.create_semaphore(&semaphore_info, None) })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let in_flight_fences = {
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        (0..FRAMES_IN_FLIGHT)
+            .map(|_| unsafe { device.create_fence(&fence_info, None) })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let images_in_flight = vec![vk::Fence::null(); swapchain.images.len()];
+
     let mut renderer = Renderer {
-        entry,
+        _entry: entry,
         instance,
         surface,
         surface_khr,
@@ -312,19 +334,22 @@ where
         device,
         present_queue_family_index,
         graphics_queue_family_index,
-        transfer_queue_family_index,
+        _transfer_queue_family_index: transfer_queue_family_index,
         graphics_queue,
         present_queue,
-        transfer_queue,
+        _transfer_queue: transfer_queue,
         command_pool,
         allocator: Some(allocator),
         swapchain,
         pipeline,
         pipeline_layout,
         command_buffers: vec![],
-        image_available_semaphore,
-        render_finished_semaphore,
-        in_flight_fence: fence,
+        image_available_semaphores,
+        render_finished_semaphores,
+        in_flight_fences,
+        images_in_flight,
+        current_frame: 0,
+        frames_in_flight: FRAMES_IN_FLIGHT,
         is_swapchain_dirty: false,
         egui_renderer: Some(egui_renderer),
     };
@@ -351,11 +376,11 @@ fn create_pipeline(
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vertex_module)
-            .name(&entry_point_name),
+            .name(entry_point_name),
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::FRAGMENT)
             .module(fragment_module)
-            .name(&entry_point_name),
+            .name(entry_point_name),
     ];
     let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
     let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -761,6 +786,7 @@ fn create_allocator(
     Ok(allocator)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_swapchain(
     instance: &ash::Instance,
     device: &ash::Device,
@@ -872,8 +898,6 @@ fn create_swapchain(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let depth_format = vk::Format::D32_SFLOAT;
-
     Ok(Swapchain {
         swapchain,
         swapchain_khr,
@@ -881,7 +905,6 @@ fn create_swapchain(
         format,
         images,
         image_views,
-        depth_format,
     })
 }
 
@@ -925,6 +948,8 @@ fn recreate_swapchain(
 
     cleanup_swapchain(renderer);
 
+    renderer.current_frame = 0;
+
     let swapchain = create_swapchain(
         &renderer.instance,
         &renderer.device,
@@ -949,6 +974,8 @@ fn recreate_swapchain(
     renderer.command_buffers = command_buffers;
     log::info!("Recreated and recorded command buffers");
 
+    renderer.images_in_flight = vec![vk::Fence::null(); renderer.swapchain.images.len()];
+
     Ok(())
 }
 
@@ -956,14 +983,18 @@ fn render_frame(
     renderer: &mut Renderer,
     ui_frame_output: Option<(egui::FullOutput, Vec<egui::ClippedPrimitive>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let fence = renderer.in_flight_fence;
-    unsafe { renderer.device.wait_for_fences(&[fence], true, u64::MAX)? };
+    let current_fence = renderer.in_flight_fences[renderer.current_frame];
+    unsafe {
+        renderer
+            .device
+            .wait_for_fences(&[current_fence], true, u64::MAX)?
+    };
 
     let next_image_result = unsafe {
         renderer.swapchain.swapchain.acquire_next_image(
             renderer.swapchain.swapchain_khr,
             u64::MAX,
-            renderer.image_available_semaphore,
+            renderer.image_available_semaphores[renderer.current_frame],
             vk::Fence::null(),
         )
     };
@@ -976,7 +1007,20 @@ fn render_frame(
         Err(error) => panic!("Error while acquiring next image: {error}"),
     };
 
-    unsafe { renderer.device.reset_fences(&[fence])? };
+    if renderer.images_in_flight[image_index as usize] != vk::Fence::null() {
+        unsafe {
+            if let Err(fence_wait_result) = renderer.device.wait_for_fences(
+                &[renderer.images_in_flight[image_index as usize]],
+                true,
+                u64::MAX,
+            ) {
+                log::error!("Error while waiting for fences: {fence_wait_result}");
+            }
+        }
+    }
+
+    renderer.images_in_flight[image_index as usize] = current_fence;
+    unsafe { renderer.device.reset_fences(&[current_fence])? };
 
     let (textures_delta, clipped_primitives, pixels_per_point) =
         if let Some((full_output, primitives)) = ui_frame_output {
@@ -1112,11 +1156,11 @@ fn render_frame(
     unsafe { renderer.device.end_command_buffer(command_buffer)? };
 
     let wait_semaphore_submit_info = vk::SemaphoreSubmitInfo::default()
-        .semaphore(renderer.image_available_semaphore)
+        .semaphore(renderer.image_available_semaphores[renderer.current_frame])
         .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
 
     let signal_semaphore_submit_info = vk::SemaphoreSubmitInfo::default()
-        .semaphore(renderer.render_finished_semaphore)
+        .semaphore(renderer.render_finished_semaphores[image_index as usize])
         .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
 
     let cmd_buffer_submit_info =
@@ -1131,11 +1175,11 @@ fn render_frame(
         renderer.device.queue_submit2(
             renderer.graphics_queue,
             std::slice::from_ref(&submit_info),
-            fence,
+            current_fence,
         )?
     };
 
-    let signal_semaphores = [renderer.render_finished_semaphore];
+    let signal_semaphores = [renderer.render_finished_semaphores[image_index as usize]];
     let swapchains = [renderer.swapchain.swapchain_khr];
     let images_indices = [image_index];
     let present_info = vk::PresentInfoKHR::default()
@@ -1159,6 +1203,7 @@ fn render_frame(
         Err(error) => panic!("Failed to present queue. Cause: {}", error),
         _ => {}
     }
+    renderer.current_frame = (renderer.current_frame + 1) % renderer.frames_in_flight;
 
     if let Some(textures_delta) = textures_delta {
         if !textures_delta.free.is_empty() {
