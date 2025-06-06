@@ -88,6 +88,7 @@ impl winit::application::ApplicationHandler for Context {
                 window_handle: Some(window_handle),
                 renderer: Some(renderer),
                 egui_state: Some(egui_state),
+                ..
             } = self
             else {
                 return;
@@ -160,16 +161,41 @@ struct Renderer {
     pub present_queue: vk::Queue,
     pub transfer_queue: Option<vk::Queue>,
     pub command_pool: vk::CommandPool,
-    pub allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    pub allocator: Option<Arc<Mutex<gpu_allocator::vulkan::Allocator>>>,
     pub swapchain: Swapchain,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub command_buffers: Vec<vk::CommandBuffer>,
     pub image_available_semaphore: vk::Semaphore,
     pub render_finished_semaphore: vk::Semaphore,
-    pub fence: vk::Fence,
+    pub in_flight_fence: vk::Fence,
     pub is_swapchain_dirty: bool,
-    pub egui_renderer: egui_ash_renderer::Renderer,
+
+    pub egui_renderer: Option<egui_ash_renderer::Renderer>,
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            self.egui_renderer = None;
+            cleanup_swapchain(self);
+
+            self.allocator = None;
+
+            self.device.destroy_fence(self.in_flight_fence, None);
+            self.device
+                .destroy_semaphore(self.image_available_semaphore, None);
+            self.device
+                .destroy_semaphore(self.render_finished_semaphore, None);
+
+            self.device.destroy_command_pool(self.command_pool, None);
+            self.device.destroy_device(None);
+            self.surface.destroy_surface(self.surface_khr, None);
+            self.debug_utils
+                .destroy_debug_utils_messenger(self.debug_utils_messenger, None);
+            self.instance.destroy_instance(None);
+        }
+    }
 }
 
 struct Swapchain {
@@ -179,6 +205,7 @@ struct Swapchain {
     pub format: vk::SurfaceFormatKHR,
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
+    pub depth_format: vk::Format,
 }
 
 fn create_renderer<W>(
@@ -290,16 +317,16 @@ where
         present_queue,
         transfer_queue,
         command_pool,
-        allocator,
+        allocator: Some(allocator),
         swapchain,
         pipeline,
         pipeline_layout,
         command_buffers: vec![],
         image_available_semaphore,
         render_finished_semaphore,
-        fence,
+        in_flight_fence: fence,
         is_swapchain_dirty: false,
-        egui_renderer,
+        egui_renderer: Some(egui_renderer),
     };
     renderer.command_buffers = create_and_record_command_buffers(&renderer)?;
     log::info!("Created and recorded command buffers");
@@ -826,7 +853,7 @@ fn create_swapchain(
     let swapchain_khr = unsafe { swapchain.create_swapchain(&create_info, None)? };
 
     let images = unsafe { swapchain.get_swapchain_images(swapchain_khr)? };
-    let views = images
+    let image_views = images
         .iter()
         .map(|image| {
             let create_info = vk::ImageViewCreateInfo::default()
@@ -845,13 +872,16 @@ fn create_swapchain(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let depth_format = vk::Format::D32_SFLOAT;
+
     Ok(Swapchain {
         swapchain,
         swapchain_khr,
         extent,
         format,
         images,
-        image_views: views,
+        image_views,
+        depth_format,
     })
 }
 
@@ -926,7 +956,7 @@ fn render_frame(
     renderer: &mut Renderer,
     ui_frame_output: Option<(egui::FullOutput, Vec<egui::ClippedPrimitive>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let fence = renderer.fence;
+    let fence = renderer.in_flight_fence;
     unsafe { renderer.device.wait_for_fences(&[fence], true, u64::MAX)? };
 
     let next_image_result = unsafe {
@@ -951,11 +981,13 @@ fn render_frame(
     let (textures_delta, clipped_primitives, pixels_per_point) =
         if let Some((full_output, primitives)) = ui_frame_output {
             if !full_output.textures_delta.set.is_empty() {
-                renderer.egui_renderer.set_textures(
-                    renderer.graphics_queue,
-                    renderer.command_pool,
-                    full_output.textures_delta.set.as_slice(),
-                )?;
+                if let Some(egui_renderer) = &mut renderer.egui_renderer {
+                    egui_renderer.set_textures(
+                        renderer.graphics_queue,
+                        renderer.command_pool,
+                        full_output.textures_delta.set.as_slice(),
+                    )?;
+                }
             }
 
             (
@@ -1041,12 +1073,14 @@ fn render_frame(
     unsafe { renderer.device.cmd_draw(command_buffer, 3, 1, 0, 0) };
 
     if let Some(primitives) = clipped_primitives {
-        renderer.egui_renderer.cmd_draw(
-            command_buffer,
-            renderer.swapchain.extent,
-            pixels_per_point,
-            &primitives,
-        )?;
+        if let Some(egui_renderer) = &mut renderer.egui_renderer {
+            egui_renderer.cmd_draw(
+                command_buffer,
+                renderer.swapchain.extent,
+                pixels_per_point,
+                &primitives,
+            )?;
+        }
     }
 
     unsafe { renderer.device.cmd_end_rendering(command_buffer) };
@@ -1128,7 +1162,9 @@ fn render_frame(
 
     if let Some(textures_delta) = textures_delta {
         if !textures_delta.free.is_empty() {
-            renderer.egui_renderer.free_textures(&textures_delta.free)?;
+            if let Some(egui_renderer) = &mut renderer.egui_renderer {
+                egui_renderer.free_textures(&textures_delta.free)?;
+            }
         }
     }
 
@@ -1137,14 +1173,18 @@ fn render_frame(
 
 fn cleanup_swapchain(renderer: &mut Renderer) {
     unsafe {
+        let _ = renderer.device.device_wait_idle();
+
         renderer
             .device
             .free_command_buffers(renderer.command_pool, &renderer.command_buffers);
         renderer.command_buffers.clear();
+
         renderer.device.destroy_pipeline(renderer.pipeline, None);
         renderer
             .device
             .destroy_pipeline_layout(renderer.pipeline_layout, None);
+
         renderer
             .swapchain
             .image_views
