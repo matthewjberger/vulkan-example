@@ -1,6 +1,6 @@
-# Rust / Vulkan / Egui Example
+# Rust / Vulkan / Winit / Egui Example
 
-This is an example of using rust, vulkan, and egui together without using eframe.
+This is an example of using rust, winit, vulkan, and egui together without using eframe.
 
 This uses Vulkan 1.3 with dynamic rendering, including the features needed for gpu-driven rendering
 
