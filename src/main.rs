@@ -144,7 +144,7 @@ impl winit::application::ApplicationHandler for Context {
     }
 }
 
-pub struct Renderer {
+struct Renderer {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
     pub surface: ash::khr::surface::Instance,
@@ -172,7 +172,7 @@ pub struct Renderer {
     pub egui_renderer: egui_ash_renderer::Renderer,
 }
 
-pub struct Swapchain {
+struct Swapchain {
     pub swapchain: swapchain::Device,
     pub swapchain_khr: vk::SwapchainKHR,
     pub extent: vk::Extent2D,
@@ -181,7 +181,7 @@ pub struct Swapchain {
     pub image_views: Vec<vk::ImageView>,
 }
 
-pub fn create_renderer<W>(
+fn create_renderer<W>(
     window_handle: W,
     initial_width: u32,
     initial_height: u32,
@@ -855,7 +855,7 @@ fn create_swapchain(
     })
 }
 
-pub fn read_shader(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+fn read_shader(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let mut cursor = std::io::Cursor::new(bytes);
     Ok(ash::util::read_spv(&mut cursor)?)
 }
@@ -880,7 +880,7 @@ fn create_and_record_command_buffers(
     Ok(buffers)
 }
 
-pub fn recreate_swapchain(
+fn recreate_swapchain(
     renderer: &mut Renderer,
     width: u32,
     height: u32,
@@ -922,7 +922,7 @@ pub fn recreate_swapchain(
     Ok(())
 }
 
-pub fn render_frame(
+fn render_frame(
     renderer: &mut Renderer,
     ui_frame_output: Option<(egui::FullOutput, Vec<egui::ClippedPrimitive>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1135,7 +1135,7 @@ pub fn render_frame(
     Ok(())
 }
 
-pub fn cleanup_swapchain(renderer: &mut Renderer) {
+fn cleanup_swapchain(renderer: &mut Renderer) {
     unsafe {
         renderer
             .device
