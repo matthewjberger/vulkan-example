@@ -182,6 +182,11 @@ struct BufferAllocation {
     allocation: gpu_allocator::vulkan::Allocation,
 }
 
+struct ImageAllocation {
+    image: vk::Image,
+    allocation: gpu_allocator::vulkan::Allocation,
+}
+
 struct Renderer {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
@@ -200,6 +205,9 @@ struct Renderer {
     pub command_pool: vk::CommandPool,
     pub allocator: Option<Arc<Mutex<gpu_allocator::vulkan::Allocator>>>,
     pub swapchain: Swapchain,
+    pub depth_image: Option<ImageAllocation>,
+    pub depth_image_view: Option<vk::ImageView>,
+    pub depth_format: vk::Format,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub command_buffers: Vec<vk::CommandBuffer>,
@@ -245,18 +253,18 @@ impl Drop for Renderer {
                 self.command_buffers.clear();
             }
 
-            for image_view in self.swapchain.image_views.iter() {
-                self.device.destroy_image_view(*image_view, None);
+            if let Some(depth_image_view) = self.depth_image_view.take() {
+                self.device.destroy_image_view(depth_image_view, None);
             }
-            self.swapchain.image_views.clear();
-
-            self.swapchain
-                .swapchain
-                .destroy_swapchain(self.swapchain.swapchain_khr, None);
 
             if let Some(allocator_arc) = &self.allocator {
                 match allocator_arc.lock() {
                     Ok(mut alloc) => {
+                        if let Some(depth_image) = self.depth_image.take() {
+                            self.device.destroy_image(depth_image.image, None);
+                            let _ = alloc.free(depth_image.allocation);
+                        }
+
                         if let Some(vertex_buffer) = self.vertex_buffer.take() {
                             self.device.destroy_buffer(vertex_buffer.buffer, None);
                             let _ = alloc.free(vertex_buffer.allocation);
@@ -280,6 +288,15 @@ impl Drop for Renderer {
                     Err(_) => log::error!("Failed to lock allocator"),
                 }
             }
+
+            for image_view in self.swapchain.image_views.iter() {
+                self.device.destroy_image_view(*image_view, None);
+            }
+            self.swapchain.image_views.clear();
+
+            self.swapchain
+                .swapchain
+                .destroy_swapchain(self.swapchain.swapchain_khr, None);
 
             let _ = self.device.device_wait_idle();
 
@@ -319,6 +336,89 @@ struct Swapchain {
     pub image_views: Vec<vk::ImageView>,
 }
 
+fn find_depth_format(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<vk::Format, Box<dyn std::error::Error>> {
+    let candidates = [
+        vk::Format::D32_SFLOAT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+        vk::Format::D24_UNORM_S8_UINT,
+    ];
+
+    for format in candidates {
+        let format_props =
+            unsafe { instance.get_physical_device_format_properties(physical_device, format) };
+
+        if format_props
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        {
+            return Ok(format);
+        }
+    }
+
+    Err("Failed to find supported depth format".into())
+}
+
+fn create_depth_buffer(
+    device: &ash::Device,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    extent: vk::Extent2D,
+    depth_format: vk::Format,
+) -> Result<(ImageAllocation, vk::ImageView), Box<dyn std::error::Error>> {
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .format(depth_format)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .samples(vk::SampleCountFlags::TYPE_1);
+
+    let image = unsafe { device.create_image(&image_info, None)? };
+
+    let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        name: "Depth Buffer",
+        requirements: unsafe { device.get_image_memory_requirements(image) },
+        location: gpu_allocator::MemoryLocation::GpuOnly,
+        linear: false,
+        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+    };
+
+    let mut allocator = allocator.lock().unwrap();
+    let allocation = allocator.allocate(&allocation_create_desc)?;
+
+    unsafe {
+        device.bind_image_memory(image, allocation.memory(), allocation.offset())?;
+    }
+
+    let image_allocation = ImageAllocation { image, allocation };
+
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image_allocation.image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(depth_format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+
+    let image_view = unsafe { device.create_image_view(&view_info, None)? };
+
+    Ok((image_allocation, image_view))
+}
+
 fn create_renderer<W>(
     window_handle: W,
     initial_width: u32,
@@ -341,6 +441,8 @@ where
         graphics_queue_family_index,
         transfer_queue_family_index,
     ) = find_vulkan_physical_device(&instance, &surface, surface_khr)?;
+
+    let depth_format = find_depth_format(&instance, physical_device)?;
 
     let mut queue_indices = vec![present_queue_family_index, graphics_queue_family_index];
     if let Some(transfer_queue_index) = transfer_queue_family_index {
@@ -371,6 +473,9 @@ where
         present_queue_family_index,
     )?;
 
+    let (depth_image, depth_image_view) =
+        create_depth_buffer(&device, &allocator, swapchain.extent, depth_format)?;
+
     let vertex_buffer = create_vertex_buffer(&device, &allocator)?;
 
     let index_buffer = create_index_buffer(&device, &allocator)?;
@@ -388,14 +493,15 @@ where
 
     update_descriptor_sets(&device, &descriptor_sets, &vertex_buffer)?;
 
-    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, descriptor_set_layout)?;
+    let (pipeline_layout, pipeline) =
+        create_pipeline(&device, &swapchain, descriptor_set_layout, depth_format)?;
 
     let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
         allocator.clone(),
         device.clone(),
         egui_ash_renderer::DynamicRendering {
             color_attachment_format: swapchain.format.format,
-            depth_attachment_format: None,
+            depth_attachment_format: Some(depth_format),
         },
         egui_ash_renderer::Options {
             in_flight_frames: 1,
@@ -446,6 +552,9 @@ where
         command_pool,
         allocator: Some(allocator),
         swapchain,
+        depth_image: Some(depth_image),
+        depth_image_view: Some(depth_image_view),
+        depth_format,
         pipeline,
         pipeline_layout,
         command_buffers: vec![],
@@ -476,51 +585,51 @@ fn create_vertex_buffer(
 ) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
     let vertices = [
         Vertex {
-            position: [-0.5, 0.5, 0.0],
+            position: [-0.5, 0.5, -1.0],
             color: [1.0, 0.0, 0.0],
         },
         Vertex {
-            position: [0.5, 0.5, 0.0],
+            position: [0.5, 0.5, -1.0],
             color: [1.0, 0.0, 0.0],
         },
         Vertex {
-            position: [0.0, -0.5, 0.0],
+            position: [0.0, -0.5, -1.0],
             color: [1.0, 0.0, 0.0],
         },
         Vertex {
-            position: [0.5, 0.5, 0.0],
+            position: [0.5, 0.5, -2.0],
             color: [0.0, 1.0, 0.0],
         },
         Vertex {
-            position: [1.5, 0.5, 0.0],
+            position: [1.5, 0.5, -2.0],
             color: [0.0, 1.0, 0.0],
         },
         Vertex {
-            position: [1.0, -0.5, 0.0],
+            position: [1.0, -0.5, -2.0],
             color: [0.0, 1.0, 0.0],
         },
         Vertex {
-            position: [-0.5, 1.5, 0.0],
+            position: [-0.5, 1.5, -3.0],
             color: [0.0, 0.0, 1.0],
         },
         Vertex {
-            position: [0.5, 1.5, 0.0],
+            position: [0.5, 1.5, -3.0],
             color: [0.0, 0.0, 1.0],
         },
         Vertex {
-            position: [0.0, 0.5, 0.0],
+            position: [0.0, 0.5, -3.0],
             color: [0.0, 0.0, 1.0],
         },
         Vertex {
-            position: [-1.5, 0.5, 0.0],
+            position: [-1.5, 0.5, -0.5],
             color: [1.0, 1.0, 0.0],
         },
         Vertex {
-            position: [-0.5, 0.5, 0.0],
+            position: [-0.5, 0.5, -0.5],
             color: [1.0, 1.0, 0.0],
         },
         Vertex {
-            position: [-1.0, -0.5, 0.0],
+            position: [-1.0, -0.5, -0.5],
             color: [1.0, 1.0, 0.0],
         },
     ];
@@ -776,6 +885,7 @@ fn create_pipeline(
     device: &ash::Device,
     swapchain: &Swapchain,
     descriptor_set_layout: vk::DescriptorSetLayout,
+    depth_format: vk::Format,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error + 'static>> {
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::VERTEX)
@@ -842,6 +952,14 @@ fn create_pipeline(
         .min_sample_shading(1.0)
         .alpha_to_coverage_enable(false)
         .alpha_to_one_enable(false);
+
+    let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS)
+        .depth_bounds_test_enable(false)
+        .stencil_test_enable(false);
+
     let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(vk::ColorComponentFlags::RGBA)
         .blend_enable(false)
@@ -858,7 +976,8 @@ fn create_pipeline(
         .blend_constants([0.0, 0.0, 0.0, 0.0]);
     let color_attachment_formats = [swapchain.format.format];
     let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(&color_attachment_formats);
+        .color_attachment_formats(&color_attachment_formats)
+        .depth_attachment_format(depth_format);
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&shader_states_infos)
         .vertex_input_state(&vertex_input_info)
@@ -866,6 +985,7 @@ fn create_pipeline(
         .viewport_state(&viewport_info)
         .rasterization_state(&rasterizer_info)
         .multisample_state(&multisampling_info)
+        .depth_stencil_state(&depth_stencil_info)
         .color_blend_state(&color_blending_info)
         .layout(pipeline_layout)
         .push_next(&mut rendering_info);
@@ -1244,7 +1364,7 @@ fn create_allocator(
     let allocator_create_info = gpu_allocator::vulkan::AllocatorCreateDesc {
         instance: instance.clone(),
         device: device.clone(),
-        physical_device: physical_device,
+        physical_device,
         debug_settings: gpu_allocator::AllocatorDebugSettings {
             log_memory_information: true,
             ..Default::default()
@@ -1428,8 +1548,23 @@ fn recreate_swapchain(
         renderer.present_queue_family_index,
     )?;
 
-    let (pipeline_layout, pipeline) =
-        create_pipeline(&renderer.device, &swapchain, renderer.descriptor_set_layout)?;
+    if let Some(allocator) = &renderer.allocator {
+        let (depth_image, depth_image_view) = create_depth_buffer(
+            &renderer.device,
+            allocator,
+            swapchain.extent,
+            renderer.depth_format,
+        )?;
+        renderer.depth_image = Some(depth_image);
+        renderer.depth_image_view = Some(depth_image_view);
+    }
+
+    let (pipeline_layout, pipeline) = create_pipeline(
+        &renderer.device,
+        &swapchain,
+        renderer.descriptor_set_layout,
+        renderer.depth_format,
+    )?;
 
     renderer.swapchain = swapchain;
     renderer.pipeline = pipeline;
@@ -1523,7 +1658,7 @@ fn render_frame(
             .begin_command_buffer(command_buffer, &command_buffer_begin_info)?
     };
 
-    let image_memory_barrier = vk::ImageMemoryBarrier2::default()
+    let color_image_memory_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
         .src_access_mask(vk::AccessFlags2::empty())
         .old_layout(vk::ImageLayout::UNDEFINED)
@@ -1538,8 +1673,27 @@ fn render_frame(
             ..Default::default()
         });
 
-    let dependency_info = vk::DependencyInfo::default()
-        .image_memory_barriers(std::slice::from_ref(&image_memory_barrier));
+    let depth_image_memory_barrier = if let Some(depth_image) = &renderer.depth_image {
+        vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS)
+            .src_access_mask(vk::AccessFlags2::empty())
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .dst_stage_mask(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS)
+            .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .new_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+            .image(depth_image.image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                layer_count: 1,
+                level_count: 1,
+                ..Default::default()
+            })
+    } else {
+        return Err("Depth image not available".into());
+    };
+
+    let image_barriers = [color_image_memory_barrier, depth_image_memory_barrier];
+    let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&image_barriers);
 
     unsafe {
         renderer
@@ -1558,13 +1712,30 @@ fn render_frame(
             },
         });
 
+    let depth_attachment_info = if let Some(depth_image_view) = renderer.depth_image_view {
+        vk::RenderingAttachmentInfo::default()
+            .image_view(depth_image_view)
+            .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .clear_value(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            })
+    } else {
+        return Err("Depth image view not available".into());
+    };
+
     let rendering_info = vk::RenderingInfo::default()
         .render_area(vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: renderer.swapchain.extent,
         })
         .layer_count(1)
-        .color_attachments(std::slice::from_ref(&color_attachment_info));
+        .color_attachments(std::slice::from_ref(&color_attachment_info))
+        .depth_attachment(&depth_attachment_info);
 
     unsafe {
         renderer
@@ -1642,7 +1813,7 @@ fn render_frame(
 
     unsafe { renderer.device.cmd_end_rendering(command_buffer) };
 
-    let image_memory_barrier = vk::ImageMemoryBarrier2::default()
+    let color_image_memory_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
         .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
         .old_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
@@ -1658,7 +1829,7 @@ fn render_frame(
         });
 
     let dependency_info = vk::DependencyInfo::default()
-        .image_memory_barriers(std::slice::from_ref(&image_memory_barrier));
+        .image_memory_barriers(std::slice::from_ref(&color_image_memory_barrier));
 
     unsafe {
         renderer
@@ -1732,6 +1903,19 @@ fn render_frame(
 fn cleanup_swapchain(renderer: &mut Renderer) {
     unsafe {
         let _ = renderer.device.device_wait_idle();
+
+        if let Some(depth_image_view) = renderer.depth_image_view.take() {
+            renderer.device.destroy_image_view(depth_image_view, None);
+        }
+
+        if let Some(allocator_arc) = &renderer.allocator {
+            if let Ok(mut alloc) = allocator_arc.lock() {
+                if let Some(depth_image) = renderer.depth_image.take() {
+                    renderer.device.destroy_image(depth_image.image, None);
+                    let _ = alloc.free(depth_image.allocation);
+                }
+            }
+        }
 
         renderer
             .device
