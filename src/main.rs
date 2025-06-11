@@ -1,4 +1,6 @@
 use ash::{ext::debug_utils, khr::swapchain, vk};
+use bytemuck::{Pod, Zeroable};
+use nalgebra_glm as glm;
 use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,18 +16,18 @@ struct Context {
     pub window_handle: Option<winit::window::Window>,
     pub renderer: Option<Renderer>,
     pub egui_state: Option<egui_winit::State>,
+    pub start_time: Option<std::time::Instant>,
 }
 
 impl winit::application::ApplicationHandler for Context {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.start_time = Some(std::time::Instant::now());
+
         let mut attributes = winit::window::Window::default_attributes();
         attributes.title = "Rust + Vulkan Example".to_string();
         if let Ok(window) = event_loop.create_window(attributes) {
-            match create_renderer(&window, 800, 600) {
-                Ok(renderer) => {
-                    self.renderer = Some(renderer);
-                }
-                Err(error) => log::error!("Failed to create renderer: {error}"),
+            if let Ok(renderer) = create_renderer(&window, 800, 600) {
+                self.renderer = Some(renderer);
             }
 
             let gui_context = egui::Context::default();
@@ -125,7 +127,11 @@ impl winit::application::ApplicationHandler for Context {
             let should_render =
                 window_handle.inner_size().width > 0 && window_handle.inner_size().height > 0;
             if should_render {
-                if let Err(error) = render_frame(renderer, ui_frame_output) {
+                let elapsed_time = self
+                    .start_time
+                    .map(|start| start.elapsed().as_secs_f32())
+                    .unwrap_or(0.0);
+                if let Err(error) = render_frame(renderer, ui_frame_output, elapsed_time) {
                     log::error!("Failed to draw frame: {error}");
                 } else {
                     renderer.is_swapchain_dirty = false;
@@ -139,10 +145,41 @@ impl winit::application::ApplicationHandler for Context {
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        if let Some(renderer) = self.renderer.as_mut() {
-            let _ = unsafe { renderer.device.device_wait_idle() };
+        if let Some(renderer) = self.renderer.take() {
+            drop(renderer);
         }
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct PushConstants {
+    model_matrix: [[f32; 4]; 4],
+    view_matrix: [[f32; 4]; 4],
+    projection_matrix: [[f32; 4]; 4],
+    camera_position: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct DrawCommand {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    vertex_offset: i32,
+    first_instance: u32,
+}
+
+struct BufferAllocation {
+    buffer: vk::Buffer,
+    allocation: gpu_allocator::vulkan::Allocation,
 }
 
 struct Renderer {
@@ -166,44 +203,108 @@ struct Renderer {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub command_buffers: Vec<vk::CommandBuffer>,
-
+    pub vertex_buffer: Option<BufferAllocation>,
+    pub index_buffer: Option<BufferAllocation>,
+    pub indirect_buffer: Option<BufferAllocation>,
+    pub count_buffer: Option<BufferAllocation>,
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_pool: vk::DescriptorPool,
+    pub descriptor_sets: Vec<vk::DescriptorSet>,
     pub image_available_semaphores: Vec<vk::Semaphore>,
     pub render_finished_semaphores: Vec<vk::Semaphore>,
     pub in_flight_fences: Vec<vk::Fence>,
     pub images_in_flight: Vec<vk::Fence>,
     pub current_frame: usize,
     pub frames_in_flight: usize,
-
     pub is_swapchain_dirty: bool,
-
     pub egui_renderer: Option<egui_ash_renderer::Renderer>,
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
+            let _ = self.device.device_wait_idle();
+
             self.egui_renderer = None;
 
-            for i in 0..self.frames_in_flight {
-                self.device.destroy_fence(self.in_flight_fences[i], None);
-                self.device
-                    .destroy_semaphore(self.image_available_semaphores[i], None);
+            for fence in self.in_flight_fences.iter() {
+                self.device.destroy_fence(*fence, None);
             }
 
-            for i in 0..self.render_finished_semaphores.len() {
-                self.device
-                    .destroy_semaphore(self.render_finished_semaphores[i], None);
+            for semaphore in self.image_available_semaphores.iter() {
+                self.device.destroy_semaphore(*semaphore, None);
             }
 
-            cleanup_swapchain(self);
+            for semaphore in self.render_finished_semaphores.iter() {
+                self.device.destroy_semaphore(*semaphore, None);
+            }
+
+            if !self.command_buffers.is_empty() {
+                self.device
+                    .free_command_buffers(self.command_pool, &self.command_buffers);
+                self.command_buffers.clear();
+            }
+
+            for image_view in self.swapchain.image_views.iter() {
+                self.device.destroy_image_view(*image_view, None);
+            }
+            self.swapchain.image_views.clear();
+
+            self.swapchain
+                .swapchain
+                .destroy_swapchain(self.swapchain.swapchain_khr, None);
+
+            if let Some(allocator_arc) = &self.allocator {
+                match allocator_arc.lock() {
+                    Ok(mut alloc) => {
+                        if let Some(vertex_buffer) = self.vertex_buffer.take() {
+                            self.device.destroy_buffer(vertex_buffer.buffer, None);
+                            let _ = alloc.free(vertex_buffer.allocation);
+                        }
+
+                        if let Some(index_buffer) = self.index_buffer.take() {
+                            self.device.destroy_buffer(index_buffer.buffer, None);
+                            let _ = alloc.free(index_buffer.allocation);
+                        }
+
+                        if let Some(indirect_buffer) = self.indirect_buffer.take() {
+                            self.device.destroy_buffer(indirect_buffer.buffer, None);
+                            let _ = alloc.free(indirect_buffer.allocation);
+                        }
+
+                        if let Some(count_buffer) = self.count_buffer.take() {
+                            self.device.destroy_buffer(count_buffer.buffer, None);
+                            let _ = alloc.free(count_buffer.allocation);
+                        }
+                    }
+                    Err(_) => log::error!("Failed to lock allocator"),
+                }
+            }
+
+            let _ = self.device.device_wait_idle();
+
+            self.device.destroy_pipeline(self.pipeline, None);
+
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
             self.allocator = None;
 
             self.device.destroy_command_pool(self.command_pool, None);
+
             self.device.destroy_device(None);
+
             self.surface.destroy_surface(self.surface_khr, None);
+
             self.debug_utils
                 .destroy_debug_utils_messenger(self.debug_utils_messenger, None);
+
             self.instance.destroy_instance(None);
         }
     }
@@ -226,19 +327,13 @@ fn create_renderer<W>(
 where
     W: raw_window_handle::HasDisplayHandle + raw_window_handle::HasWindowHandle,
 {
-    log::info!("Creating vulkan render backend");
-
     let entry = unsafe { ash::Entry::load()? };
-    log::info!("Loaded vulkan entry");
 
     let instance = create_instance(&window_handle, &entry)?;
-    log::info!("Loaded vulkan instance");
 
     let (surface, surface_khr) = create_surface(window_handle, &entry, &instance)?;
-    log::info!("Created vulkan surface");
 
     let (debug_utils, debug_utils_messenger) = create_debug_utils(&entry, &instance)?;
-    log::info!("Created vulkan debug utils");
 
     let (
         physical_device,
@@ -246,7 +341,6 @@ where
         graphics_queue_family_index,
         transfer_queue_family_index,
     ) = find_vulkan_physical_device(&instance, &surface, surface_khr)?;
-    log::info!("Found a supported vulkan physical device");
 
     let mut queue_indices = vec![present_queue_family_index, graphics_queue_family_index];
     if let Some(transfer_queue_index) = transfer_queue_family_index {
@@ -254,20 +348,16 @@ where
     }
     queue_indices.dedup();
     let device = create_device(&instance, physical_device, &queue_indices)?;
-    log::info!("Created vulkan logical device");
 
     let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family_index, 0) };
     let present_queue = unsafe { device.get_device_queue(present_queue_family_index, 0) };
     let transfer_queue =
         transfer_queue_family_index.map(|index| unsafe { device.get_device_queue(index, 0) });
-    log::info!("Got device queues");
 
     let command_pool = create_command_pool(graphics_queue_family_index, &device)?;
-    log::info!("Created command pool");
 
     let allocator = create_allocator(&instance, physical_device, &device)?;
     let allocator = Arc::new(Mutex::new(allocator));
-    log::info!("Created gpu memory allocator");
 
     let swapchain = create_swapchain(
         &instance,
@@ -280,10 +370,25 @@ where
         graphics_queue_family_index,
         present_queue_family_index,
     )?;
-    log::info!("Created swapchain");
 
-    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain)?;
-    log::info!("Created render pipeline and layout");
+    let vertex_buffer = create_vertex_buffer(&device, &allocator)?;
+
+    let index_buffer = create_index_buffer(&device, &allocator)?;
+
+    let indirect_buffer = create_indirect_buffer(&device, &allocator)?;
+
+    let count_buffer = create_count_buffer(&device, &allocator)?;
+
+    let descriptor_set_layout = create_descriptor_set_layout(&device)?;
+
+    let descriptor_pool = create_descriptor_pool(&device)?;
+
+    let descriptor_sets =
+        allocate_descriptor_sets(&device, descriptor_pool, descriptor_set_layout)?;
+
+    update_descriptor_sets(&device, &descriptor_sets, &vertex_buffer)?;
+
+    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, descriptor_set_layout)?;
 
     let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
         allocator.clone(),
@@ -344,6 +449,13 @@ where
         pipeline,
         pipeline_layout,
         command_buffers: vec![],
+        vertex_buffer: Some(vertex_buffer),
+        index_buffer: Some(index_buffer),
+        indirect_buffer: Some(indirect_buffer),
+        count_buffer: Some(count_buffer),
+        descriptor_set_layout,
+        descriptor_pool,
+        descriptor_sets,
         image_available_semaphores,
         render_finished_semaphores,
         in_flight_fences,
@@ -354,16 +466,327 @@ where
         egui_renderer: Some(egui_renderer),
     };
     renderer.command_buffers = create_and_record_command_buffers(&renderer)?;
-    log::info!("Created and recorded command buffers");
 
     Ok(renderer)
+}
+
+fn create_vertex_buffer(
+    device: &ash::Device,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
+    let vertices = [
+        Vertex {
+            position: [-0.5, 0.5, 0.0],
+            color: [1.0, 0.0, 0.0],
+        },
+        Vertex {
+            position: [0.5, 0.5, 0.0],
+            color: [1.0, 0.0, 0.0],
+        },
+        Vertex {
+            position: [0.0, -0.5, 0.0],
+            color: [1.0, 0.0, 0.0],
+        },
+        Vertex {
+            position: [0.5, 0.5, 0.0],
+            color: [0.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [1.5, 0.5, 0.0],
+            color: [0.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [1.0, -0.5, 0.0],
+            color: [0.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [-0.5, 1.5, 0.0],
+            color: [0.0, 0.0, 1.0],
+        },
+        Vertex {
+            position: [0.5, 1.5, 0.0],
+            color: [0.0, 0.0, 1.0],
+        },
+        Vertex {
+            position: [0.0, 0.5, 0.0],
+            color: [0.0, 0.0, 1.0],
+        },
+        Vertex {
+            position: [-1.5, 0.5, 0.0],
+            color: [1.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [-0.5, 0.5, 0.0],
+            color: [1.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [-1.0, -0.5, 0.0],
+            color: [1.0, 1.0, 0.0],
+        },
+    ];
+
+    let buffer_size = std::mem::size_of_val(&vertices) as vk::DeviceSize;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(buffer_size)
+        .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+
+    let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        name: "Vertex Buffer",
+        requirements: unsafe { device.get_buffer_memory_requirements(buffer) },
+        location: gpu_allocator::MemoryLocation::CpuToGpu,
+        linear: true,
+        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+    };
+
+    let mut allocator = allocator.lock().unwrap();
+    let allocation = allocator.allocate(&allocation_create_desc)?;
+
+    unsafe {
+        device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
+    }
+
+    unsafe {
+        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+        let vertex_bytes = bytemuck::cast_slice(&vertices);
+        std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), data_ptr, vertex_bytes.len());
+    }
+
+    Ok(BufferAllocation { buffer, allocation })
+}
+
+fn create_index_buffer(
+    device: &ash::Device,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
+    let indices: [u32; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+    let buffer_size = std::mem::size_of_val(&indices) as vk::DeviceSize;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(buffer_size)
+        .usage(vk::BufferUsageFlags::INDEX_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+
+    let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        name: "Index Buffer",
+        requirements: unsafe { device.get_buffer_memory_requirements(buffer) },
+        location: gpu_allocator::MemoryLocation::CpuToGpu,
+        linear: true,
+        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+    };
+
+    let mut allocator = allocator.lock().unwrap();
+    let allocation = allocator.allocate(&allocation_create_desc)?;
+
+    unsafe {
+        device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
+    }
+
+    unsafe {
+        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+        let index_bytes = bytemuck::cast_slice(&indices);
+        std::ptr::copy_nonoverlapping(index_bytes.as_ptr(), data_ptr, index_bytes.len());
+    }
+
+    Ok(BufferAllocation { buffer, allocation })
+}
+
+fn create_indirect_buffer(
+    device: &ash::Device,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
+    let draw_commands = [
+        DrawCommand {
+            index_count: 3,
+            instance_count: 1,
+            first_index: 0,
+            vertex_offset: 0,
+            first_instance: 0,
+        },
+        DrawCommand {
+            index_count: 3,
+            instance_count: 1,
+            first_index: 3,
+            vertex_offset: 0,
+            first_instance: 0,
+        },
+        DrawCommand {
+            index_count: 3,
+            instance_count: 1,
+            first_index: 6,
+            vertex_offset: 0,
+            first_instance: 0,
+        },
+        DrawCommand {
+            index_count: 3,
+            instance_count: 1,
+            first_index: 9,
+            vertex_offset: 0,
+            first_instance: 0,
+        },
+    ];
+
+    let buffer_size = std::mem::size_of_val(&draw_commands) as vk::DeviceSize;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(buffer_size)
+        .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+
+    let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        name: "Indirect Buffer",
+        requirements: unsafe { device.get_buffer_memory_requirements(buffer) },
+        location: gpu_allocator::MemoryLocation::CpuToGpu,
+        linear: true,
+        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+    };
+
+    let mut allocator = allocator.lock().unwrap();
+    let allocation = allocator.allocate(&allocation_create_desc)?;
+
+    unsafe {
+        device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
+    }
+
+    unsafe {
+        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+        let command_bytes = bytemuck::cast_slice(&draw_commands);
+        std::ptr::copy_nonoverlapping(command_bytes.as_ptr(), data_ptr, command_bytes.len());
+    }
+
+    Ok(BufferAllocation { buffer, allocation })
+}
+
+fn create_count_buffer(
+    device: &ash::Device,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
+    let count: u32 = 4;
+
+    let buffer_size = std::mem::size_of::<u32>() as vk::DeviceSize;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(buffer_size)
+        .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+
+    let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        name: "Count Buffer",
+        requirements: unsafe { device.get_buffer_memory_requirements(buffer) },
+        location: gpu_allocator::MemoryLocation::CpuToGpu,
+        linear: true,
+        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+    };
+
+    let mut allocator = allocator.lock().unwrap();
+    let allocation = allocator.allocate(&allocation_create_desc)?;
+
+    unsafe {
+        device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
+    }
+
+    unsafe {
+        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+        let count_bytes = bytemuck::bytes_of(&count);
+        std::ptr::copy_nonoverlapping(count_bytes.as_ptr(), data_ptr, count_bytes.len());
+    }
+
+    Ok(BufferAllocation { buffer, allocation })
+}
+
+fn create_descriptor_set_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout, Box<dyn std::error::Error>> {
+    let binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::VERTEX);
+
+    let create_info =
+        vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
+
+    let layout = unsafe { device.create_descriptor_set_layout(&create_info, None)? };
+    Ok(layout)
+}
+
+fn create_descriptor_pool(
+    device: &ash::Device,
+) -> Result<vk::DescriptorPool, Box<dyn std::error::Error>> {
+    let pool_size = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1);
+
+    let create_info = vk::DescriptorPoolCreateInfo::default()
+        .pool_sizes(std::slice::from_ref(&pool_size))
+        .max_sets(1);
+
+    let pool = unsafe { device.create_descriptor_pool(&create_info, None)? };
+    Ok(pool)
+}
+
+fn allocate_descriptor_sets(
+    device: &ash::Device,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+) -> Result<Vec<vk::DescriptorSet>, Box<dyn std::error::Error>> {
+    let layouts = [descriptor_set_layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&layouts);
+
+    let descriptor_sets = unsafe { device.allocate_descriptor_sets(&allocate_info)? };
+    Ok(descriptor_sets)
+}
+
+fn update_descriptor_sets(
+    device: &ash::Device,
+    descriptor_sets: &[vk::DescriptorSet],
+    vertex_buffer: &BufferAllocation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(vertex_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(descriptor_sets[0])
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(std::slice::from_ref(&buffer_info));
+
+    unsafe {
+        device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
+    }
+
+    Ok(())
 }
 
 fn create_pipeline(
     device: &ash::Device,
     swapchain: &Swapchain,
+    descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error + 'static>> {
-    let layout_info = vk::PipelineLayoutCreateInfo::default();
+    let push_constant_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(std::mem::size_of::<PushConstants>() as u32);
+
+    let set_layouts = [descriptor_set_layout];
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(std::slice::from_ref(&push_constant_range));
+
     let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
     let entry_point_name = c"main";
     let vertex_source = read_shader(&include_bytes!("shaders/triangle.vert.spv")[..])?;
@@ -407,7 +830,7 @@ fn create_pipeline(
         .rasterizer_discard_enable(false)
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
-        .cull_mode(vk::CullModeFlags::BACK)
+        .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .depth_bias_enable(false)
         .depth_bias_constant_factor(0.0)
@@ -462,6 +885,33 @@ fn create_pipeline(
     Ok((pipeline_layout, pipeline))
 }
 
+fn create_push_constants(time: f32) -> PushConstants {
+    let camera_pos = glm::vec3(4.0, 4.0, 4.0);
+    let target = glm::vec3(0.0, 0.0, 0.0);
+    let up = glm::vec3(0.0, 1.0, 0.0);
+
+    let view_matrix = glm::look_at(&camera_pos, &target, &up);
+
+    let fov = 45.0_f32.to_radians();
+    let aspect = 4.0 / 3.0;
+    let near = 0.1;
+    let far = 100.0;
+    let projection_matrix = glm::perspective(aspect, fov, near, far);
+
+    let rotation_speed = 1.0;
+    let angle = time * rotation_speed;
+    let model_matrix = glm::rotate(&glm::Mat4::identity(), angle, &glm::vec3(0.0, 1.0, 0.0));
+
+    let camera_position = [camera_pos.x, camera_pos.y, camera_pos.z, 1.0];
+
+    PushConstants {
+        model_matrix: model_matrix.into(),
+        view_matrix: view_matrix.into(),
+        projection_matrix: projection_matrix.into(),
+        camera_position,
+    }
+}
+
 fn create_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -483,7 +933,11 @@ fn create_device(
     let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true);
-    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut features13);
+    let mut features12 = vk::PhysicalDeviceVulkan12Features::default().draw_indirect_count(true);
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .features(vk::PhysicalDeviceFeatures::default().multi_draw_indirect(true))
+        .push_next(&mut features12)
+        .push_next(&mut features13);
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_info_list)
         .enabled_extension_names(&device_extensions_ptrs)
@@ -599,6 +1053,12 @@ extern "system" fn vulkan_debug_callback(
     vk::FALSE
 }
 
+struct PhysicalDeviceFeatures {
+    device_features: vk::PhysicalDeviceFeatures,
+    vulkan12_features: vk::PhysicalDeviceVulkan12Features<'static>,
+    vulkan13_features: vk::PhysicalDeviceVulkan13Features<'static>,
+}
+
 #[allow(clippy::type_complexity)]
 fn find_vulkan_physical_device(
     instance: &ash::Instance,
@@ -619,7 +1079,7 @@ fn find_vulkan_physical_device(
             )
         });
         if physical_device.is_some() {
-            log::info!("No discrete GPU is available, using integrated GPU");
+            log::warn!("No discrete GPU is available, using integrated GPU");
         }
     }
     let Some(physical_device) = physical_device else {
@@ -655,20 +1115,21 @@ fn find_vulkan_physical_device(
     }
 
     let features = get_physical_device_features(instance, physical_device);
-    let supports_dynamic_rendering = features.dynamic_rendering == vk::TRUE;
+    let supports_dynamic_rendering = features.vulkan13_features.dynamic_rendering == vk::TRUE;
     if !supports_dynamic_rendering {
         return Err("Physical device does not support dynamic rendering".into());
     }
-    let supports_synchronization = features.synchronization2 == vk::TRUE;
+    let supports_synchronization = features.vulkan13_features.synchronization2 == vk::TRUE;
     if !supports_synchronization {
         return Err("Physical device does not support synchronization".into());
     }
+    let supports_draw_indirect_count = features.vulkan12_features.draw_indirect_count == vk::TRUE;
+    if !supports_draw_indirect_count {
+        return Err("Physical device does not support draw indirect count".into());
+    }
 
-    log::info!("Found graphics queue {graphics_queue_family_index}");
-    log::info!("Found present queue {present_queue_family_index}");
-
-    if let Some(transfer_queue_index) = transfer_queue_family_index {
-        log::info!("Found dedicated transfer queue {transfer_queue_index}");
+    if features.device_features.multi_draw_indirect == vk::FALSE {
+        return Err("Physical device does not support multi-draw indirect".into());
     }
 
     Ok((
@@ -682,11 +1143,20 @@ fn find_vulkan_physical_device(
 fn get_physical_device_features(
     instance: &ash::Instance,
     physical_device: &vk::PhysicalDevice,
-) -> vk::PhysicalDeviceVulkan13Features<'static> {
-    let mut vulkan_features_1_3 = vk::PhysicalDeviceVulkan13Features::default();
-    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan_features_1_3);
-    unsafe { instance.get_physical_device_features2(*physical_device, &mut features) };
-    vulkan_features_1_3
+) -> PhysicalDeviceFeatures {
+    let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
+    let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features::default();
+    let mut features2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut vulkan12_features)
+        .push_next(&mut vulkan13_features);
+
+    unsafe { instance.get_physical_device_features2(*physical_device, &mut features2) };
+
+    PhysicalDeviceFeatures {
+        device_features: features2.features,
+        vulkan12_features,
+        vulkan13_features,
+    }
 }
 
 fn swapchain_supported(
@@ -816,7 +1286,6 @@ fn create_swapchain(
                 .unwrap_or(&formats[0])
         }
     };
-    log::info!("Swapchain format: {format:?}");
 
     let present_mode = {
         let present_modes = unsafe {
@@ -828,7 +1297,6 @@ fn create_swapchain(
             vk::PresentModeKHR::FIFO
         }
     };
-    log::info!("Swapchain present mode: {present_mode:?}");
 
     let capabilities =
         unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
@@ -844,10 +1312,8 @@ fn create_swapchain(
             vk::Extent2D { width, height }
         }
     };
-    log::info!("Swapchain extent: {:?}", extent);
 
     let image_count = capabilities.min_image_count;
-    log::info!("Swapchain image count: {:?}", image_count);
 
     let families_indices = [graphics_queue_family_index, present_queue_family_index];
     let create_info = {
@@ -920,7 +1386,6 @@ fn create_and_record_command_buffers(
     let pool = renderer.command_pool;
     let count = renderer.swapchain.images.len();
 
-    log::info!("Creating and recording command buffers");
     let buffers = {
         let allocate_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
@@ -938,15 +1403,16 @@ fn recreate_swapchain(
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!(
-        "Recreating the swapchain with dimensions {}x{}",
-        width,
-        height
-    );
-
     unsafe { renderer.device.device_wait_idle() }?;
 
     cleanup_swapchain(renderer);
+
+    unsafe {
+        renderer.device.destroy_pipeline(renderer.pipeline, None);
+        renderer
+            .device
+            .destroy_pipeline_layout(renderer.pipeline_layout, None);
+    }
 
     renderer.current_frame = 0;
 
@@ -961,10 +1427,9 @@ fn recreate_swapchain(
         renderer.graphics_queue_family_index,
         renderer.present_queue_family_index,
     )?;
-    log::info!("Recreated swapchain");
 
-    let (pipeline_layout, pipeline) = create_pipeline(&renderer.device, &swapchain)?;
-    log::info!("Recreated render pipeline and layout");
+    let (pipeline_layout, pipeline) =
+        create_pipeline(&renderer.device, &swapchain, renderer.descriptor_set_layout)?;
 
     renderer.swapchain = swapchain;
     renderer.pipeline = pipeline;
@@ -972,7 +1437,6 @@ fn recreate_swapchain(
 
     let command_buffers = create_and_record_command_buffers(renderer)?;
     renderer.command_buffers = command_buffers;
-    log::info!("Recreated and recorded command buffers");
 
     renderer.images_in_flight = vec![vk::Fence::null(); renderer.swapchain.images.len()];
 
@@ -982,6 +1446,7 @@ fn recreate_swapchain(
 fn render_frame(
     renderer: &mut Renderer,
     ui_frame_output: Option<(egui::FullOutput, Vec<egui::ClippedPrimitive>)>,
+    elapsed_time: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current_fence = renderer.in_flight_fences[renderer.current_frame];
     unsafe {
@@ -1001,10 +1466,10 @@ fn render_frame(
     let image_index = match next_image_result {
         Ok((image_index, _)) => image_index,
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-            log::info!("Swapchain is out of date");
+            log::error!("Swapchain is out of date");
             return Ok(());
         }
-        Err(error) => panic!("Error while acquiring next image: {error}"),
+        Err(error) => return Err(error.into()),
     };
 
     if renderer.images_in_flight[image_index as usize] != vk::Fence::null() {
@@ -1107,6 +1572,17 @@ fn render_frame(
             .cmd_begin_rendering(command_buffer, &rendering_info)
     };
 
+    let push_constants = create_push_constants(elapsed_time);
+    unsafe {
+        renderer.device.cmd_push_constants(
+            command_buffer,
+            renderer.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            bytemuck::bytes_of(&push_constants),
+        );
+    }
+
     unsafe {
         renderer.device.cmd_bind_pipeline(
             command_buffer,
@@ -1114,7 +1590,44 @@ fn render_frame(
             renderer.pipeline,
         )
     };
-    unsafe { renderer.device.cmd_draw(command_buffer, 3, 1, 0, 0) };
+
+    unsafe {
+        renderer.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            renderer.pipeline_layout,
+            0,
+            &renderer.descriptor_sets,
+            &[],
+        );
+    }
+
+    if let Some(index_buffer) = &renderer.index_buffer {
+        unsafe {
+            renderer.device.cmd_bind_index_buffer(
+                command_buffer,
+                index_buffer.buffer,
+                0,
+                vk::IndexType::UINT32,
+            );
+        }
+    }
+
+    if let (Some(indirect_buffer), Some(count_buffer)) =
+        (&renderer.indirect_buffer, &renderer.count_buffer)
+    {
+        unsafe {
+            renderer.device.cmd_draw_indexed_indirect_count(
+                command_buffer,
+                indirect_buffer.buffer,
+                0,
+                count_buffer.buffer,
+                0,
+                4,
+                std::mem::size_of::<DrawCommand>() as u32,
+            );
+        }
+    }
 
     if let Some(primitives) = clipped_primitives {
         if let Some(egui_renderer) = &mut renderer.egui_renderer {
@@ -1200,7 +1713,7 @@ fn render_frame(
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
             return Ok(());
         }
-        Err(error) => panic!("Failed to present queue. Cause: {}", error),
+        Err(error) => log::error!("Failed to present queue. Cause: {error}"),
         _ => {}
     }
     renderer.current_frame = (renderer.current_frame + 1) % renderer.frames_in_flight;
@@ -1224,11 +1737,6 @@ fn cleanup_swapchain(renderer: &mut Renderer) {
             .device
             .free_command_buffers(renderer.command_pool, &renderer.command_buffers);
         renderer.command_buffers.clear();
-
-        renderer.device.destroy_pipeline(renderer.pipeline, None);
-        renderer
-            .device
-            .destroy_pipeline_layout(renderer.pipeline_layout, None);
 
         renderer
             .swapchain
