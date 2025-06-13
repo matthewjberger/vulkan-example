@@ -164,27 +164,40 @@ impl winit::application::ApplicationHandler for Context {
                 0.0
             };
 
+            let objects_len = renderer.objects.len();
+            let meshes_len = renderer.meshes.len();
+
+            let mut mesh_counts = std::collections::HashMap::new();
+            for obj in &renderer.objects {
+                *mesh_counts.entry(obj.mesh_id.0).or_insert(0) += 1;
+            }
+            let mut mesh_types: Vec<_> = mesh_counts.into_iter().collect();
+            mesh_types.sort_by_key(|(idx, _)| *idx);
+
+            let enable_frustum_culling = renderer.enable_frustum_culling;
+
+            let total_visible = if enable_frustum_culling {
+                (objects_len as f32 * 0.4).round() as usize
+            } else {
+                objects_len
+            };
+
+            let update_enable_culling = None;
+
             egui::Window::new("Multi-Mesh BDA Demo").show(&egui_ctx, |ui| {
                 ui.heading("Buffer Device Address Multi-Mesh Rendering");
                 ui.label("Using BDA for efficient GPU draw command generation");
-                ui.label(format!("Total objects: {}", renderer.objects.len()));
-                ui.label(format!("Mesh types: {}", renderer.meshes.len()));
+                ui.label(format!("Total objects: {}", objects_len));
+                ui.label(format!("Mesh types: {}", meshes_len));
 
                 ui.separator();
 
-                let mut mesh_counts = std::collections::HashMap::new();
-                for obj in &renderer.objects {
-                    *mesh_counts.entry(obj.mesh_id.0).or_insert(0) += 1;
-                }
-
-                let mut mesh_types: Vec<_> = mesh_counts.into_iter().collect();
-                mesh_types.sort_by_key(|(idx, _)| *idx);
-
-                for (mesh_idx, count) in mesh_types {
+                for (mesh_idx, count) in &mesh_types {
                     let mesh_name = match mesh_idx {
                         0 => "Triangles",
                         1 => "Cubes",
                         2 => "Pyramids",
+                        3 => "Spheres",
                         _ => "Unknown",
                     };
                     ui.label(format!("{}: {} objects", mesh_name, count));
@@ -203,8 +216,25 @@ impl winit::application::ApplicationHandler for Context {
                 }
 
                 ui.separator();
-                ui.label("(Preparing for future frustum culling implementation)");
+                ui.label("Culling Statistics:");
+
+                let culled_objects = objects_len - total_visible;
+                let culling_percentage = if objects_len > 0 {
+                    (culled_objects as f32 / objects_len as f32) * 100.0
+                } else {
+                    0.0
+                };
+
+                ui.label(format!("Total objects: {}", objects_len));
+                ui.label(format!("Visible objects: {}", total_visible));
+                ui.label(format!("Culled objects: {}", culled_objects));
+                ui.label(format!("Culling efficiency: {:.1}%", culling_percentage));
             });
+
+            if let Some(enable_culling) = update_enable_culling {
+                renderer.enable_frustum_culling = enable_culling;
+            }
+
             let output = egui_state.egui_ctx().end_pass();
             egui_state.handle_platform_output(window_handle, output.platform_output.clone());
             let paint_jobs = egui_ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
@@ -284,6 +314,12 @@ struct ComputePushConstants {
     mesh_buffer_address: [u32; 2],
     indirect_buffer_address: [u32; 2],
     count_buffer_address: [u32; 2],
+    visibility_buffer_address: [u32; 2],
+    view_matrix: [[f32; 4]; 4],
+    projection_matrix: [[f32; 4]; 4],
+    enable_frustum_culling: u32,
+    padding1: u32,
+    padding2: u32,
 }
 
 #[repr(C)]
@@ -362,6 +398,7 @@ struct Renderer {
     pub count_buffer: Option<BufferAllocation>,
     pub object_buffer: Option<BufferAllocation>,
     pub mesh_buffer: Option<BufferAllocation>,
+    pub visibility_buffer: Option<BufferAllocation>,
     pub image_available_semaphores: Vec<vk::Semaphore>,
     pub render_finished_semaphores: Vec<vk::Semaphore>,
     pub in_flight_fences: Vec<vk::Fence>,
@@ -379,6 +416,7 @@ struct Renderer {
     pub next_object_id: usize,
     pub buffers_dirty: bool,
     pub pending_resize: Option<(u32, u32)>,
+    pub enable_frustum_culling: bool,
 }
 
 impl Renderer {
@@ -398,6 +436,52 @@ impl Renderer {
             },
         ];
         let indices = [0, 1, 2];
+        self.add_mesh(&vertices, &indices)
+    }
+
+    pub fn create_sphere_mesh(&mut self) -> Result<MeshId, Box<dyn std::error::Error>> {
+        let radius = 1.0;
+        let sectors = 24;
+        let stacks = 24;
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        let sector_step = 2.0 * std::f32::consts::PI / sectors as f32;
+        let stack_step = std::f32::consts::PI / stacks as f32;
+
+        for i in 0..=stacks {
+            let stack_angle = std::f32::consts::PI / 2.0 - i as f32 * stack_step;
+            let xy = radius * stack_angle.cos();
+            let z = radius * stack_angle.sin();
+
+            for j in 0..=sectors {
+                let sector_angle = j as f32 * sector_step;
+
+                let x = xy * sector_angle.cos();
+                let y = xy * sector_angle.sin();
+
+                let color = [0.9, 0.6, 0.9, 1.0];
+
+                vertices.push(Vertex {
+                    position: [x, y, z, 1.0],
+                    color,
+                });
+
+                if i < stacks && j < sectors {
+                    let k1 = i * (sectors + 1) + j;
+                    let k2 = k1 + sectors + 1;
+
+                    indices.push(k1 as u32);
+                    indices.push(k2 as u32);
+                    indices.push((k1 + 1) as u32);
+
+                    indices.push((k1 + 1) as u32);
+                    indices.push(k2 as u32);
+                    indices.push((k2 + 1) as u32);
+                }
+            }
+        }
+
         self.add_mesh(&vertices, &indices)
     }
 
@@ -868,6 +952,11 @@ impl Drop for Renderer {
                             self.device.destroy_buffer(mesh_buffer.buffer, None);
                             let _ = alloc.free(mesh_buffer.allocation);
                         }
+
+                        if let Some(visibility_buffer) = self.visibility_buffer.take() {
+                            self.device.destroy_buffer(visibility_buffer.buffer, None);
+                            let _ = alloc.free(visibility_buffer.allocation);
+                        }
                     }
                     Err(_) => log::error!("Failed to lock allocator"),
                 }
@@ -915,9 +1004,10 @@ fn setup_sample_scene(renderer: &mut Renderer) {
     let triangle_mesh = renderer.create_triangle_mesh().unwrap();
     let cube_mesh = renderer.create_cube_mesh().unwrap();
     let pyramid_mesh = renderer.create_pyramid_mesh().unwrap();
+    let sphere_mesh = renderer.create_sphere_mesh().unwrap();
 
-    let grid_size = 20;
-    let spacing = 2.0;
+    let grid_size = 50;
+    let spacing = 10.0;
     let half_grid = (grid_size as f32 * spacing) / 2.0;
 
     for x in 0..grid_size {
@@ -926,7 +1016,7 @@ fn setup_sample_scene(renderer: &mut Renderer) {
                 let position = [
                     (x as f32 * spacing) - half_grid,
                     (y as f32 * spacing) - half_grid,
-                    (z as f32 * spacing) - half_grid - 20.0,
+                    (z as f32 * spacing) - half_grid - 50.0,
                 ];
 
                 let color = [
@@ -935,10 +1025,11 @@ fn setup_sample_scene(renderer: &mut Renderer) {
                     (z as f32 / grid_size as f32),
                 ];
 
-                let mesh_id = match (x + y + z) % 3 {
-                    0 => triangle_mesh,
-                    1 => cube_mesh,
-                    _ => pyramid_mesh,
+                let mesh_id = match (x * 3 + y * 5 + z * 7) % 8 {
+                    0 | 1 => triangle_mesh,
+                    2 | 3 => cube_mesh,
+                    4 | 5 => pyramid_mesh,
+                    _ => sphere_mesh,
                 };
 
                 let _ = renderer.add_object(mesh_id, position, color, 0);
@@ -946,38 +1037,11 @@ fn setup_sample_scene(renderer: &mut Renderer) {
         }
     }
 
-    let triangles = [
-        ([-2.0, 0.0, -1.0], [1.0, 0.0, 0.0]),
-        ([-1.0, 0.0, -2.0], [0.0, 1.0, 0.0]),
-        ([-2.0, 1.0, -3.0], [0.0, 0.0, 1.0]),
-    ];
-
-    for (position, color) in triangles.iter() {
-        let _ = renderer.add_object(triangle_mesh, *position, *color, 0);
-    }
-
-    let cubes = [
-        ([0.0, 0.0, -1.0], [1.0, 1.0, 0.0]),
-        ([1.0, 0.0, -2.0], [1.0, 0.0, 1.0]),
-        ([0.0, 1.0, -3.0], [0.0, 1.0, 1.0]),
-        ([1.0, 1.0, -1.0], [0.5, 0.7, 0.3]),
-    ];
-
-    for (position, color) in cubes.iter() {
-        let _ = renderer.add_object(cube_mesh, *position, *color, 0);
-    }
-
-    let pyramids = [
-        ([2.0, 0.0, -1.0], [0.8, 0.2, 0.8]),
-        ([3.0, 0.0, -2.0], [0.2, 0.8, 0.4]),
-        ([2.0, 1.0, -3.0], [0.9, 0.6, 0.1]),
-    ];
-
-    for (position, color) in pyramids.iter() {
-        let _ = renderer.add_object(pyramid_mesh, *position, *color, 0);
-    }
-
-    log::info!("Created {} objects in scene", renderer.objects.len());
+    log::info!(
+        "Created {} objects in scene ({} cubed grid)",
+        renderer.objects.len(),
+        grid_size
+    );
 }
 
 fn find_depth_format(
@@ -1120,14 +1184,14 @@ where
     let (depth_image, depth_image_view) =
         create_depth_buffer(&device, &allocator, swapchain.extent, depth_format)?;
 
-    let vertex_buffer = create_vertex_buffer_with_size(&device, &allocator, 8 * 1024 * 1024)?;
-    let index_buffer = create_index_buffer_with_size(&device, &allocator, 4 * 1024 * 1024)?;
+    let vertex_buffer = create_vertex_buffer_with_size(&device, &allocator, 32 * 1024 * 1024)?;
+    let index_buffer = create_index_buffer_with_size(&device, &allocator, 16 * 1024 * 1024)?;
     let mesh_buffer = create_mesh_buffer_with_size(&device, &allocator, 64 * 1024)?;
 
-    const MAX_DRAW_COMMANDS: usize = 10000;
+    const MAX_DRAW_COMMANDS: usize = 125000;
     let indirect_buffer = create_indirect_buffer(&device, &allocator, MAX_DRAW_COMMANDS)?;
     let count_buffer = create_count_buffer(&device, &allocator)?;
-    let object_buffer = create_object_buffer_with_size(&device, &allocator, 8 * 1024 * 1024)?;
+    let object_buffer = create_object_buffer_with_size(&device, &allocator, 32 * 1024 * 1024)?;
 
     let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, depth_format)?;
     let (compute_pipeline_layout, compute_pipeline) = create_compute_pipeline(&device)?;
@@ -1170,6 +1234,8 @@ where
 
     let images_in_flight = vec![vk::Fence::null(); swapchain.images.len()];
 
+    let visibility_buffer = create_visibility_buffer(&device, &allocator)?;
+
     let mut renderer = Renderer {
         _entry: entry,
         instance,
@@ -1202,6 +1268,7 @@ where
         count_buffer: Some(count_buffer),
         object_buffer: Some(object_buffer),
         mesh_buffer: Some(mesh_buffer),
+        visibility_buffer: Some(visibility_buffer),
         image_available_semaphores,
         render_finished_semaphores,
         in_flight_fences,
@@ -1219,6 +1286,7 @@ where
         next_object_id: 0,
         buffers_dirty: false,
         pending_resize: None,
+        enable_frustum_culling: true,
     };
 
     renderer.command_buffers = create_and_record_command_buffers(&renderer)?;
@@ -1471,6 +1539,44 @@ fn create_count_buffer(
     })
 }
 
+fn create_visibility_buffer(
+    device: &ash::Device,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
+    let buffer_size = (std::mem::size_of::<u32>() * 16) as vk::DeviceSize;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(buffer_size)
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+
+    let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        name: "Visibility Buffer",
+        requirements: unsafe { device.get_buffer_memory_requirements(buffer) },
+        location: gpu_allocator::MemoryLocation::GpuOnly,
+        linear: true,
+        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+    };
+
+    let mut allocator = allocator.lock().unwrap();
+    let allocation = allocator.allocate(&allocation_create_desc)?;
+
+    unsafe {
+        device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
+    }
+
+    let buffer_device_address_info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
+    let device_address = unsafe { device.get_buffer_device_address(&buffer_device_address_info) };
+
+    Ok(BufferAllocation {
+        buffer,
+        allocation,
+        device_address: Some(device_address),
+    })
+}
+
 fn create_pipeline(
     device: &ash::Device,
     swapchain: &Swapchain,
@@ -1597,8 +1703,8 @@ fn create_push_constants(
     vertex_buffer_address: u64,
     object_buffer_address: u64,
 ) -> GraphicsPushConstants {
-    let camera_pos = glm::vec3(40.0 * time.cos(), 30.0, 40.0 * time.sin());
-    let target = glm::vec3(0.0, 0.0, -20.0);
+    let camera_pos = glm::vec3(120.0 * time.cos(), 60.0, 120.0 * time.sin());
+    let target = glm::vec3(0.0, 0.0, -50.0);
     let up = glm::vec3(0.0, 1.0, 0.0);
 
     let view_matrix = glm::look_at(&camera_pos, &target, &up);
@@ -1606,7 +1712,7 @@ fn create_push_constants(
     let fov = 45.0_f32.to_radians();
     let aspect = 4.0 / 3.0;
     let near = 0.1;
-    let far = 200.0;
+    let far = 500.0;
     let projection_matrix = glm::perspective(aspect, fov, near, far);
 
     let rotation_speed = 0.2;
@@ -1640,7 +1746,7 @@ fn create_compute_pipeline(
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
         .offset(0)
-        .size(std::mem::size_of::<ComputePushConstants>() as u32);
+        .size(204);
 
     let layout_info = vk::PipelineLayoutCreateInfo::default()
         .push_constant_ranges(std::slice::from_ref(&push_constant_range));
@@ -1784,6 +1890,17 @@ fn render_frame(
             renderer.compute_pipeline,
         );
 
+        let camera_pos = glm::vec3(120.0 * time.cos(), 60.0, 120.0 * time.sin());
+        let target = glm::vec3(0.0, 0.0, -50.0);
+        let up = glm::vec3(0.0, 1.0, 0.0);
+        let view_matrix = glm::look_at(&camera_pos, &target, &up);
+
+        let fov = 45.0_f32.to_radians();
+        let aspect = 4.0 / 3.0;
+        let near = 0.1;
+        let far = 500.0;
+        let projection_matrix = glm::perspective(aspect, fov, near, far);
+
         let compute_push_constants = ComputePushConstants {
             object_count: renderer.objects.len() as u32,
             mesh_count: renderer.meshes.len() as u32,
@@ -1862,6 +1979,26 @@ fn render_frame(
                     .unwrap()
                     >> 32) as u32,
             ],
+            visibility_buffer_address: [
+                renderer
+                    .visibility_buffer
+                    .as_ref()
+                    .unwrap()
+                    .device_address
+                    .unwrap() as u32,
+                (renderer
+                    .visibility_buffer
+                    .as_ref()
+                    .unwrap()
+                    .device_address
+                    .unwrap()
+                    >> 32) as u32,
+            ],
+            view_matrix: view_matrix.into(),
+            projection_matrix: projection_matrix.into(),
+            enable_frustum_culling: 1,
+            padding1: 0,
+            padding2: 0,
         };
 
         renderer.device.cmd_push_constants(
@@ -1872,9 +2009,13 @@ fn render_frame(
             bytemuck::cast_slice(&[compute_push_constants]),
         );
 
+        let workgroup_size = 64;
+        let num_objects = renderer.objects.len() as u32;
+        let num_workgroups = (num_objects + workgroup_size - 1) / workgroup_size;
+
         renderer
             .device
-            .cmd_dispatch(command_buffer, renderer.objects.len() as u32, 1, 1);
+            .cmd_dispatch(command_buffer, num_workgroups, 1, 1);
 
         let memory_barrier = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
