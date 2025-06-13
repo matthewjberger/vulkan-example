@@ -24,7 +24,7 @@ impl winit::application::ApplicationHandler for Context {
         self.start_time = Some(std::time::Instant::now());
 
         let mut attributes = winit::window::Window::default_attributes();
-        attributes.title = "Rust + Vulkan Example".to_string();
+        attributes.title = "Rust + Vulkan Instancing Example".to_string();
         if let Ok(window) = event_loop.create_window(attributes) {
             if let Ok(mut renderer) = create_renderer(&window, 800, 600) {
                 setup_sample_scene(&mut renderer);
@@ -117,8 +117,10 @@ impl winit::application::ApplicationHandler for Context {
             let gui_input = egui_state.take_egui_input(window_handle);
             egui_state.egui_ctx().begin_pass(gui_input);
             let egui_ctx = egui_state.egui_ctx().clone();
-            egui::Window::new("Hello World").show(&egui_ctx, |ui| {
-                ui.heading("Hello World");
+            egui::Window::new("Instancing Demo").show(&egui_ctx, |ui| {
+                ui.heading("Multiple Triangles from One Geometry");
+                ui.label("Using instancing to render multiple triangles");
+                ui.label(format!("Instance count: {}", renderer.objects.len()));
             });
             let output = egui_state.egui_ctx().end_pass();
             egui_state.handle_platform_output(window_handle, output.platform_output.clone());
@@ -182,6 +184,7 @@ struct DrawCommand {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Object {
     position: [f32; 4],
+    color: [f32; 4],
     mesh_index: u32,
     material_index: u32,
     padding1: u32,
@@ -212,6 +215,7 @@ struct MeshData {
 struct ObjectData {
     mesh_id: MeshId,
     position: [f32; 3],
+    color: [f32; 3],
     material_index: u32,
 }
 
@@ -313,6 +317,7 @@ impl Renderer {
         &mut self,
         mesh_id: MeshId,
         position: [f32; 3],
+        color: [f32; 3],
         material_index: u32,
     ) -> Result<ObjectId, Box<dyn std::error::Error>> {
         if mesh_id.0 >= self.meshes.len() {
@@ -325,6 +330,7 @@ impl Renderer {
         let object_data = ObjectData {
             mesh_id,
             position,
+            color,
             material_index,
         };
 
@@ -445,6 +451,7 @@ impl Renderer {
             &self.device,
             &self.descriptor_sets,
             self.vertex_buffer.as_ref().unwrap(),
+            self.object_buffer.as_ref().unwrap(),
         )?;
 
         Ok(())
@@ -512,13 +519,14 @@ impl Renderer {
             .objects
             .iter()
             .enumerate()
-            .map(|(index, obj_data)| Object {
+            .map(|(_, obj_data)| Object {
                 position: [
                     obj_data.position[0],
                     obj_data.position[1],
                     obj_data.position[2],
                     1.0,
                 ],
+                color: [obj_data.color[0], obj_data.color[1], obj_data.color[2], 1.0],
                 mesh_index: obj_data.mesh_id.0 as u32,
                 material_index: obj_data.material_index,
                 padding1: 0,
@@ -570,6 +578,13 @@ impl Renderer {
         let allocator = self.allocator.as_ref().ok_or("Allocator not available")?;
         let new_buffer = create_object_buffer_with_size(&self.device, allocator, size)?;
         self.object_buffer = Some(new_buffer);
+
+        update_descriptor_sets(
+            &self.device,
+            &self.descriptor_sets,
+            self.vertex_buffer.as_ref().unwrap(),
+            self.object_buffer.as_ref().unwrap(),
+        )?;
 
         update_compute_descriptor_sets(
             &self.device,
@@ -705,85 +720,109 @@ struct Swapchain {
 }
 
 fn setup_sample_scene(renderer: &mut Renderer) {
-    let triangle1_vertices = [
+    let base_triangle_vertices = [
         Vertex {
-            position: [-0.5, 0.5, -1.0],
-            color: [1.0, 0.0, 0.0],
+            position: [0.0, 0.5, 0.0],
+            color: [1.0, 1.0, 1.0],
         },
         Vertex {
-            position: [0.5, 0.5, -1.0],
-            color: [1.0, 0.0, 0.0],
+            position: [-0.5, -0.5, 0.0],
+            color: [1.0, 1.0, 1.0],
         },
         Vertex {
-            position: [0.0, -0.5, -1.0],
-            color: [1.0, 0.0, 0.0],
-        },
-    ];
-    let triangle1_indices = [0, 1, 2];
-
-    let triangle2_vertices = [
-        Vertex {
-            position: [0.5, 0.5, -2.0],
-            color: [0.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [1.5, 0.5, -2.0],
-            color: [0.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [1.0, -0.5, -2.0],
-            color: [0.0, 1.0, 0.0],
+            position: [0.5, -0.5, 0.0],
+            color: [1.0, 1.0, 1.0],
         },
     ];
-    let triangle2_indices = [0, 1, 2];
+    let triangle_indices = [0, 1, 2];
 
-    let triangle3_vertices = [
-        Vertex {
-            position: [-0.5, 1.5, -3.0],
-            color: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            position: [0.5, 1.5, -3.0],
-            color: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            position: [0.0, 0.5, -3.0],
-            color: [0.0, 0.0, 1.0],
-        },
+    if let Ok(mesh_id) = renderer.add_mesh(&base_triangle_vertices, &triangle_indices) {
+        let instances = [
+            ([-0.5, 0.5, -1.0], [1.0, 0.0, 0.0]),
+            ([0.5, 0.5, -2.0], [0.0, 1.0, 0.0]),
+            ([0.0, 1.5, -3.0], [0.0, 0.0, 1.0]),
+            ([-1.0, 0.5, -0.5], [1.0, 1.0, 0.0]),
+            ([1.0, -0.5, -1.5], [1.0, 0.0, 1.0]),
+            ([0.0, -1.0, -2.5], [0.0, 1.0, 1.0]),
+        ];
+
+        for (position, color) in instances.iter() {
+            let _ = renderer.add_object(mesh_id, *position, *color, 0);
+        }
+    }
+}
+
+fn create_descriptor_set_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout, Box<dyn std::error::Error>> {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
     ];
-    let triangle3_indices = [0, 1, 2];
 
-    let triangle4_vertices = [
-        Vertex {
-            position: [-1.5, 0.5, -0.5],
-            color: [1.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [-0.5, 0.5, -0.5],
-            color: [1.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [-1.0, -0.5, -0.5],
-            color: [1.0, 1.0, 0.0],
-        },
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+    let layout = unsafe { device.create_descriptor_set_layout(&create_info, None)? };
+    Ok(layout)
+}
+
+fn create_descriptor_pool(
+    device: &ash::Device,
+) -> Result<vk::DescriptorPool, Box<dyn std::error::Error>> {
+    let pool_sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(8)];
+
+    let create_info = vk::DescriptorPoolCreateInfo::default()
+        .pool_sizes(&pool_sizes)
+        .max_sets(4);
+
+    let pool = unsafe { device.create_descriptor_pool(&create_info, None)? };
+    Ok(pool)
+}
+
+fn update_descriptor_sets(
+    device: &ash::Device,
+    descriptor_sets: &[vk::DescriptorSet],
+    vertex_buffer: &BufferAllocation,
+    object_buffer: &BufferAllocation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vertex_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(vertex_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let object_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(object_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&vertex_buffer_info)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&object_buffer_info)),
     ];
-    let triangle4_indices = [0, 1, 2];
 
-    if let Ok(mesh1) = renderer.add_mesh(&triangle1_vertices, &triangle1_indices) {
-        let _ = renderer.add_object(mesh1, [0.0, 0.0, -1.0], 0);
+    unsafe {
+        device.update_descriptor_sets(&writes, &[]);
     }
 
-    if let Ok(mesh2) = renderer.add_mesh(&triangle2_vertices, &triangle2_indices) {
-        let _ = renderer.add_object(mesh2, [1.0, 0.0, -2.0], 0);
-    }
-
-    if let Ok(mesh3) = renderer.add_mesh(&triangle3_vertices, &triangle3_indices) {
-        let _ = renderer.add_object(mesh3, [0.0, 1.0, -3.0], 0);
-    }
-
-    if let Ok(mesh4) = renderer.add_mesh(&triangle4_vertices, &triangle4_indices) {
-        let _ = renderer.add_object(mesh4, [-1.0, 0.0, -0.5], 0);
-    }
+    Ok(())
 }
 
 fn find_depth_format(
@@ -938,7 +977,7 @@ where
     let descriptor_pool = create_descriptor_pool(&device)?;
     let descriptor_sets =
         allocate_descriptor_sets(&device, descriptor_pool, descriptor_set_layout)?;
-    update_descriptor_sets(&device, &descriptor_sets, &vertex_buffer)?;
+    update_descriptor_sets(&device, &descriptor_sets, &vertex_buffer, &object_buffer)?;
 
     let (pipeline_layout, pipeline) =
         create_pipeline(&device, &swapchain, descriptor_set_layout, depth_format)?;
@@ -1214,37 +1253,6 @@ fn create_count_buffer(
     Ok(BufferAllocation { buffer, allocation })
 }
 
-fn create_descriptor_set_layout(
-    device: &ash::Device,
-) -> Result<vk::DescriptorSetLayout, Box<dyn std::error::Error>> {
-    let binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::VERTEX);
-
-    let create_info =
-        vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
-
-    let layout = unsafe { device.create_descriptor_set_layout(&create_info, None)? };
-    Ok(layout)
-}
-
-fn create_descriptor_pool(
-    device: &ash::Device,
-) -> Result<vk::DescriptorPool, Box<dyn std::error::Error>> {
-    let pool_sizes = [vk::DescriptorPoolSize::default()
-        .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(4)];
-
-    let create_info = vk::DescriptorPoolCreateInfo::default()
-        .pool_sizes(&pool_sizes)
-        .max_sets(2);
-
-    let pool = unsafe { device.create_descriptor_pool(&create_info, None)? };
-    Ok(pool)
-}
-
 fn allocate_descriptor_sets(
     device: &ash::Device,
     descriptor_pool: vk::DescriptorPool,
@@ -1257,29 +1265,6 @@ fn allocate_descriptor_sets(
 
     let descriptor_sets = unsafe { device.allocate_descriptor_sets(&allocate_info)? };
     Ok(descriptor_sets)
-}
-
-fn update_descriptor_sets(
-    device: &ash::Device,
-    descriptor_sets: &[vk::DescriptorSet],
-    vertex_buffer: &BufferAllocation,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let buffer_info = vk::DescriptorBufferInfo::default()
-        .buffer(vertex_buffer.buffer)
-        .offset(0)
-        .range(vk::WHOLE_SIZE);
-
-    let write = vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_sets[0])
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(std::slice::from_ref(&buffer_info));
-
-    unsafe {
-        device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
-    }
-
-    Ok(())
 }
 
 fn update_compute_descriptor_sets(
@@ -1539,7 +1524,7 @@ fn create_instance(
     window_handle: &impl raw_window_handle::HasDisplayHandle,
     entry: &ash::Entry,
 ) -> Result<ash::Instance, Box<dyn std::error::Error + 'static>> {
-    let app_name = c"Rust + Vulkan Example";
+    let app_name = c"Rust + Vulkan Instancing Example";
     let app_info = vk::ApplicationInfo::default()
         .application_name(app_name)
         .application_version(vk::make_api_version(0, 0, 1, 0))
@@ -2165,10 +2150,7 @@ fn render_frame(
             bytemuck::bytes_of(&push_constants),
         );
 
-        let workgroup_count = (renderer.objects.len() as u32 + 63) / 64;
-        renderer
-            .device
-            .cmd_dispatch(command_buffer, workgroup_count, 1, 1);
+        renderer.device.cmd_dispatch(command_buffer, 1, 1, 1);
     }
 
     let compute_buffer_barrier = vk::BufferMemoryBarrier2::default()
@@ -2334,7 +2316,7 @@ fn render_frame(
                 0,
                 count_buffer.buffer,
                 0,
-                64,
+                1,
                 std::mem::size_of::<DrawCommand>() as u32,
             );
         }
