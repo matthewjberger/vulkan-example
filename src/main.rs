@@ -17,11 +17,15 @@ struct Context {
     pub renderer: Option<Renderer>,
     pub egui_state: Option<egui_winit::State>,
     pub start_time: Option<std::time::Instant>,
+    pub last_frame_time: Option<std::time::Instant>,
+    pub frame_times: Vec<f32>,
 }
 
 impl winit::application::ApplicationHandler for Context {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         self.start_time = Some(std::time::Instant::now());
+        self.last_frame_time = Some(std::time::Instant::now());
+        self.frame_times = Vec::with_capacity(100);
 
         let mut attributes = winit::window::Window::default_attributes();
         attributes.title = "Rust + Vulkan Multi-Mesh BDA Instancing".to_string();
@@ -82,6 +86,7 @@ impl winit::application::ApplicationHandler for Context {
 
                 if let Some(renderer) = &mut self.renderer {
                     renderer.is_swapchain_dirty = true;
+                    renderer.pending_resize = Some((width, height));
                 }
             }
             return;
@@ -97,15 +102,39 @@ impl winit::application::ApplicationHandler for Context {
                 return;
             };
 
+            if renderer.pending_resize.take().is_some() {
+                window_handle.request_redraw();
+                return;
+            }
+
             if renderer.is_swapchain_dirty {
                 let dimension = window_handle.inner_size();
                 if dimension.width > 0 && dimension.height > 0 {
                     match recreate_swapchain(renderer, dimension.width, dimension.height) {
                         Ok(()) => {
                             renderer.is_swapchain_dirty = false;
+
+                            let gui_context = egui::Context::default();
+                            gui_context.set_pixels_per_point(window_handle.scale_factor() as _);
+
+                            let viewport_id = gui_context.viewport_id();
+                            *egui_state = egui_winit::State::new(
+                                gui_context,
+                                viewport_id,
+                                window_handle,
+                                Some(window_handle.scale_factor() as _),
+                                Some(winit::window::Theme::Dark),
+                                None,
+                            );
+
+                            egui_extras::install_image_loaders(egui_state.egui_ctx());
+
+                            window_handle.request_redraw();
+                            return;
                         }
                         Err(error) => {
                             log::error!("Failed to recreate swapchain: {error}");
+                            window_handle.request_redraw();
                             return;
                         }
                     }
@@ -117,6 +146,24 @@ impl winit::application::ApplicationHandler for Context {
             let gui_input = egui_state.take_egui_input(window_handle);
             egui_state.egui_ctx().begin_pass(gui_input);
             let egui_ctx = egui_state.egui_ctx().clone();
+
+            let now = std::time::Instant::now();
+            if let Some(last_time) = self.last_frame_time {
+                let frame_time = now.duration_since(last_time).as_secs_f32();
+                self.frame_times.push(frame_time);
+
+                if self.frame_times.len() > 60 {
+                    self.frame_times.remove(0);
+                }
+            }
+            self.last_frame_time = Some(now);
+
+            let avg_frame_time = if !self.frame_times.is_empty() {
+                self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32
+            } else {
+                0.0
+            };
+
             egui::Window::new("Multi-Mesh BDA Demo").show(&egui_ctx, |ui| {
                 ui.heading("Buffer Device Address Multi-Mesh Rendering");
                 ui.label("Using BDA for efficient GPU draw command generation");
@@ -124,20 +171,39 @@ impl winit::application::ApplicationHandler for Context {
                 ui.label(format!("Mesh types: {}", renderer.meshes.len()));
 
                 ui.separator();
+
                 let mut mesh_counts = std::collections::HashMap::new();
                 for obj in &renderer.objects {
                     *mesh_counts.entry(obj.mesh_id.0).or_insert(0) += 1;
                 }
 
-                for (mesh_idx, count) in mesh_counts {
+                let mut mesh_types: Vec<_> = mesh_counts.into_iter().collect();
+                mesh_types.sort_by_key(|(idx, _)| *idx);
+
+                for (mesh_idx, count) in mesh_types {
                     let mesh_name = match mesh_idx {
                         0 => "Triangles",
                         1 => "Cubes",
                         2 => "Pyramids",
                         _ => "Unknown",
                     };
-                    ui.label(format!("{}: {}", mesh_name, count));
+                    ui.label(format!("{}: {} objects", mesh_name, count));
                 }
+
+                ui.separator();
+
+                if let Some(start) = self.start_time {
+                    let total_elapsed = start.elapsed().as_secs_f32();
+
+                    ui.label(format!("Frame time: {:.2} ms", avg_frame_time * 1000.0));
+                    if avg_frame_time > 0.0 {
+                        ui.label(format!("FPS: {:.1}", 1.0 / avg_frame_time));
+                    }
+                    ui.label(format!("Total runtime: {:.1} s", total_elapsed));
+                }
+
+                ui.separator();
+                ui.label("(Preparing for future frustum culling implementation)");
             });
             let output = egui_state.egui_ctx().end_pass();
             egui_state.handle_platform_output(window_handle, output.platform_output.clone());
@@ -312,6 +378,7 @@ struct Renderer {
     pub next_mesh_id: usize,
     pub next_object_id: usize,
     pub buffers_dirty: bool,
+    pub pending_resize: Option<(u32, u32)>,
 }
 
 impl Renderer {
@@ -849,6 +916,36 @@ fn setup_sample_scene(renderer: &mut Renderer) {
     let cube_mesh = renderer.create_cube_mesh().unwrap();
     let pyramid_mesh = renderer.create_pyramid_mesh().unwrap();
 
+    let grid_size = 20;
+    let spacing = 2.0;
+    let half_grid = (grid_size as f32 * spacing) / 2.0;
+
+    for x in 0..grid_size {
+        for y in 0..grid_size {
+            for z in 0..grid_size {
+                let position = [
+                    (x as f32 * spacing) - half_grid,
+                    (y as f32 * spacing) - half_grid,
+                    (z as f32 * spacing) - half_grid - 20.0,
+                ];
+
+                let color = [
+                    (x as f32 / grid_size as f32),
+                    (y as f32 / grid_size as f32),
+                    (z as f32 / grid_size as f32),
+                ];
+
+                let mesh_id = match (x + y + z) % 3 {
+                    0 => triangle_mesh,
+                    1 => cube_mesh,
+                    _ => pyramid_mesh,
+                };
+
+                let _ = renderer.add_object(mesh_id, position, color, 0);
+            }
+        }
+    }
+
     let triangles = [
         ([-2.0, 0.0, -1.0], [1.0, 0.0, 0.0]),
         ([-1.0, 0.0, -2.0], [0.0, 1.0, 0.0]),
@@ -879,6 +976,8 @@ fn setup_sample_scene(renderer: &mut Renderer) {
     for (position, color) in pyramids.iter() {
         let _ = renderer.add_object(pyramid_mesh, *position, *color, 0);
     }
+
+    log::info!("Created {} objects in scene", renderer.objects.len());
 }
 
 fn find_depth_format(
@@ -1021,14 +1120,14 @@ where
     let (depth_image, depth_image_view) =
         create_depth_buffer(&device, &allocator, swapchain.extent, depth_format)?;
 
-    let vertex_buffer = create_vertex_buffer_with_size(&device, &allocator, 1024 * 1024)?;
-    let index_buffer = create_index_buffer_with_size(&device, &allocator, 256 * 1024)?;
+    let vertex_buffer = create_vertex_buffer_with_size(&device, &allocator, 8 * 1024 * 1024)?;
+    let index_buffer = create_index_buffer_with_size(&device, &allocator, 4 * 1024 * 1024)?;
     let mesh_buffer = create_mesh_buffer_with_size(&device, &allocator, 64 * 1024)?;
 
-    const MAX_DRAW_COMMANDS: usize = 64;
+    const MAX_DRAW_COMMANDS: usize = 10000;
     let indirect_buffer = create_indirect_buffer(&device, &allocator, MAX_DRAW_COMMANDS)?;
     let count_buffer = create_count_buffer(&device, &allocator)?;
-    let object_buffer = create_object_buffer_with_size(&device, &allocator, 64 * 1024)?;
+    let object_buffer = create_object_buffer_with_size(&device, &allocator, 8 * 1024 * 1024)?;
 
     let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, depth_format)?;
     let (compute_pipeline_layout, compute_pipeline) = create_compute_pipeline(&device)?;
@@ -1119,6 +1218,7 @@ where
         next_mesh_id: 0,
         next_object_id: 0,
         buffers_dirty: false,
+        pending_resize: None,
     };
 
     renderer.command_buffers = create_and_record_command_buffers(&renderer)?;
@@ -1284,6 +1384,12 @@ fn create_indirect_buffer(
     max_commands: usize,
 ) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
     let buffer_size = (std::mem::size_of::<DrawCommand>() * max_commands) as vk::DeviceSize;
+
+    log::info!(
+        "Creating indirect buffer with capacity for {} commands ({} bytes)",
+        max_commands,
+        buffer_size
+    );
 
     let buffer_info = vk::BufferCreateInfo::default()
         .size(buffer_size)
@@ -1491,8 +1597,8 @@ fn create_push_constants(
     vertex_buffer_address: u64,
     object_buffer_address: u64,
 ) -> GraphicsPushConstants {
-    let camera_pos = glm::vec3(4.0, 4.0, 4.0);
-    let target = glm::vec3(0.0, 0.0, 0.0);
+    let camera_pos = glm::vec3(40.0 * time.cos(), 30.0, 40.0 * time.sin());
+    let target = glm::vec3(0.0, 0.0, -20.0);
     let up = glm::vec3(0.0, 1.0, 0.0);
 
     let view_matrix = glm::look_at(&camera_pos, &target, &up);
@@ -1500,10 +1606,10 @@ fn create_push_constants(
     let fov = 45.0_f32.to_radians();
     let aspect = 4.0 / 3.0;
     let near = 0.1;
-    let far = 100.0;
+    let far = 200.0;
     let projection_matrix = glm::perspective(aspect, fov, near, far);
 
-    let rotation_speed = 1.0;
+    let rotation_speed = 0.2;
     let angle = time * rotation_speed;
     let model_matrix = glm::rotate(&glm::Mat4::identity(), angle, &glm::vec3(0.0, 1.0, 0.0));
 
@@ -1580,6 +1686,10 @@ fn render_frame(
     ui_frame_output: Option<(egui::FullOutput, Vec<egui::ClippedPrimitive>)>,
     time: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if renderer.pending_resize.is_some() {
+        return Ok(());
+    }
+
     renderer.update_buffers_if_dirty()?;
 
     if renderer.objects.is_empty() {
@@ -1627,13 +1737,19 @@ fn render_frame(
 
     let (textures_delta, clipped_primitives, pixels_per_point) =
         if let Some((full_output, primitives)) = ui_frame_output {
-            if !full_output.textures_delta.set.is_empty() {
-                if let Some(egui_renderer) = &mut renderer.egui_renderer {
-                    egui_renderer.set_textures(
+            if let Some(egui_renderer) = &mut renderer.egui_renderer {
+                if !full_output.textures_delta.set.is_empty() {
+                    match egui_renderer.set_textures(
                         renderer.graphics_queue,
                         renderer.command_pool,
                         full_output.textures_delta.set.as_slice(),
-                    )?;
+                    ) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::warn!("Failed to set egui textures: {}", e);
+                            return Err("Failed to update egui textures".into());
+                        }
+                    }
                 }
             }
 
@@ -1784,9 +1900,10 @@ fn render_frame(
         .image(renderer.swapchain.images[image_index as usize])
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
-            layer_count: 1,
+            base_mip_level: 0,
             level_count: 1,
-            ..Default::default()
+            base_array_layer: 0,
+            layer_count: 1,
         });
 
     let dependency_info = vk::DependencyInfo::default()
@@ -1884,12 +2001,17 @@ fn render_frame(
 
         if let Some(primitives) = clipped_primitives {
             if let Some(egui_renderer) = &mut renderer.egui_renderer {
-                egui_renderer.cmd_draw(
+                match egui_renderer.cmd_draw(
                     command_buffer,
                     renderer.swapchain.extent,
                     pixels_per_point,
                     &primitives,
-                )?;
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("Failed to draw egui primitives: {}", e);
+                    }
+                }
             }
         }
 
@@ -1972,7 +2094,12 @@ fn render_frame(
     if let Some(textures_delta) = textures_delta {
         if !textures_delta.free.is_empty() {
             if let Some(egui_renderer) = &mut renderer.egui_renderer {
-                egui_renderer.free_textures(&textures_delta.free)?;
+                match egui_renderer.free_textures(&textures_delta.free) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("Failed to free egui textures: {}", e);
+                    }
+                }
             }
         }
     }
@@ -2507,7 +2634,11 @@ fn recreate_swapchain(
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    unsafe { renderer.device.device_wait_idle() }?;
+    unsafe {
+        renderer.device.device_wait_idle()?;
+    }
+
+    renderer.egui_renderer.take();
 
     cleanup_swapchain(renderer);
 
@@ -2550,10 +2681,42 @@ fn recreate_swapchain(
     renderer.pipeline = pipeline;
     renderer.pipeline_layout = pipeline_layout;
 
+    if let Some(allocator) = &renderer.allocator {
+        if let Some(indirect_buffer) = renderer.indirect_buffer.take() {
+            if let Ok(mut alloc) = allocator.lock() {
+                unsafe {
+                    renderer.device.destroy_buffer(indirect_buffer.buffer, None);
+                }
+                let _ = alloc.free(indirect_buffer.allocation);
+            }
+        }
+
+        let object_count = renderer.objects.len();
+        let max_draw_commands = (object_count as f32 * 1.2) as usize;
+        let max_draw_commands = max_draw_commands.max(10000);
+
+        renderer.indirect_buffer = Some(create_indirect_buffer(
+            &renderer.device,
+            allocator,
+            max_draw_commands,
+        )?);
+
+        if let Some(count_buffer) = renderer.count_buffer.take() {
+            if let Ok(mut alloc) = allocator.lock() {
+                unsafe {
+                    renderer.device.destroy_buffer(count_buffer.buffer, None);
+                }
+                let _ = alloc.free(count_buffer.allocation);
+            }
+        }
+        renderer.count_buffer = Some(create_count_buffer(&renderer.device, allocator)?);
+    }
+
     let command_buffers = create_and_record_command_buffers(renderer)?;
     renderer.command_buffers = command_buffers;
 
     if let Some(allocator) = &renderer.allocator {
+        log::info!("Recreating egui renderer after resize");
         let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
             allocator.clone(),
             renderer.device.clone(),
@@ -2566,6 +2729,7 @@ fn recreate_swapchain(
                 ..Default::default()
             },
         )?;
+
         renderer.egui_renderer = Some(egui_renderer);
     }
 
