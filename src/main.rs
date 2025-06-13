@@ -26,7 +26,8 @@ impl winit::application::ApplicationHandler for Context {
         let mut attributes = winit::window::Window::default_attributes();
         attributes.title = "Rust + Vulkan Example".to_string();
         if let Ok(window) = event_loop.create_window(attributes) {
-            if let Ok(renderer) = create_renderer(&window, 800, 600) {
+            if let Ok(mut renderer) = create_renderer(&window, 800, 600) {
+                setup_sample_scene(&mut renderer);
                 self.renderer = Some(renderer);
             }
 
@@ -177,6 +178,43 @@ struct DrawCommand {
     first_instance: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct Object {
+    position: [f32; 4],
+    mesh_index: u32,
+    material_index: u32,
+    padding1: u32,
+    padding2: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct ComputePushConstants {
+    object_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MeshId(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ObjectId(usize);
+
+#[derive(Debug, Clone)]
+struct MeshData {
+    vertex_offset: u32,
+    vertex_count: u32,
+    index_offset: u32,
+    index_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectData {
+    mesh_id: MeshId,
+    position: [f32; 3],
+    material_index: u32,
+}
+
 struct BufferAllocation {
     buffer: vk::Buffer,
     allocation: gpu_allocator::vulkan::Allocation,
@@ -210,14 +248,19 @@ struct Renderer {
     pub depth_format: vk::Format,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
+    pub compute_pipeline: vk::Pipeline,
+    pub compute_pipeline_layout: vk::PipelineLayout,
     pub command_buffers: Vec<vk::CommandBuffer>,
     pub vertex_buffer: Option<BufferAllocation>,
     pub index_buffer: Option<BufferAllocation>,
     pub indirect_buffer: Option<BufferAllocation>,
     pub count_buffer: Option<BufferAllocation>,
+    pub object_buffer: Option<BufferAllocation>,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub descriptor_pool: vk::DescriptorPool,
     pub descriptor_sets: Vec<vk::DescriptorSet>,
+    pub compute_descriptor_set_layout: vk::DescriptorSetLayout,
+    pub compute_descriptor_sets: Vec<vk::DescriptorSet>,
     pub image_available_semaphores: Vec<vk::Semaphore>,
     pub render_finished_semaphores: Vec<vk::Semaphore>,
     pub in_flight_fences: Vec<vk::Fence>,
@@ -226,6 +269,318 @@ struct Renderer {
     pub frames_in_flight: usize,
     pub is_swapchain_dirty: bool,
     pub egui_renderer: Option<egui_ash_renderer::Renderer>,
+
+    pub vertices: Vec<Vertex>,
+    pub indices: Vec<u32>,
+    pub meshes: Vec<MeshData>,
+    pub objects: Vec<ObjectData>,
+    pub next_mesh_id: usize,
+    pub next_object_id: usize,
+    pub buffers_dirty: bool,
+}
+
+impl Renderer {
+    pub fn add_mesh(
+        &mut self,
+        vertices: &[Vertex],
+        indices: &[u32],
+    ) -> Result<MeshId, Box<dyn std::error::Error>> {
+        let vertex_offset = self.vertices.len() as u32;
+        let vertex_count = vertices.len() as u32;
+        let index_offset = self.indices.len() as u32;
+        let index_count = indices.len() as u32;
+
+        self.vertices.extend_from_slice(vertices);
+        self.indices.extend_from_slice(indices);
+
+        let mesh_id = MeshId(self.next_mesh_id);
+        self.next_mesh_id += 1;
+
+        let mesh_data = MeshData {
+            vertex_offset,
+            vertex_count,
+            index_offset,
+            index_count,
+        };
+
+        self.meshes.push(mesh_data);
+        self.buffers_dirty = true;
+
+        Ok(mesh_id)
+    }
+
+    pub fn add_object(
+        &mut self,
+        mesh_id: MeshId,
+        position: [f32; 3],
+        material_index: u32,
+    ) -> Result<ObjectId, Box<dyn std::error::Error>> {
+        if mesh_id.0 >= self.meshes.len() {
+            return Err("Invalid mesh ID".into());
+        }
+
+        let object_id = ObjectId(self.next_object_id);
+        self.next_object_id += 1;
+
+        let object_data = ObjectData {
+            mesh_id,
+            position,
+            material_index,
+        };
+
+        self.objects.push(object_data);
+        self.buffers_dirty = true;
+
+        Ok(object_id)
+    }
+
+    pub fn remove_object(&mut self, object_id: ObjectId) -> Result<(), Box<dyn std::error::Error>> {
+        if object_id.0 >= self.objects.len() {
+            return Err("Invalid object ID".into());
+        }
+
+        self.objects.remove(object_id.0);
+        self.buffers_dirty = true;
+
+        Ok(())
+    }
+
+    pub fn update_object_position(
+        &mut self,
+        object_id: ObjectId,
+        position: [f32; 3],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if object_id.0 >= self.objects.len() {
+            return Err("Invalid object ID".into());
+        }
+
+        self.objects[object_id.0].position = position;
+        self.buffers_dirty = true;
+
+        Ok(())
+    }
+
+    pub fn clear_scene(&mut self) {
+        self.vertices.clear();
+        self.indices.clear();
+        self.meshes.clear();
+        self.objects.clear();
+        self.next_mesh_id = 0;
+        self.next_object_id = 0;
+        self.buffers_dirty = true;
+    }
+
+    fn update_buffers_if_dirty(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.buffers_dirty {
+            return Ok(());
+        }
+
+        if !self.vertices.is_empty() {
+            self.update_vertex_buffer()?;
+        }
+
+        if !self.indices.is_empty() {
+            self.update_index_buffer()?;
+        }
+
+        if !self.objects.is_empty() {
+            self.update_object_buffer()?;
+        }
+
+        self.buffers_dirty = false;
+        Ok(())
+    }
+
+    fn update_vertex_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.vertices.is_empty() {
+            return Ok(());
+        }
+
+        let buffer_size = (std::mem::size_of::<Vertex>() * self.vertices.len()) as vk::DeviceSize;
+
+        if let Some(ref buffer) = self.vertex_buffer {
+            let current_size = unsafe {
+                self.device
+                    .get_buffer_memory_requirements(buffer.buffer)
+                    .size
+            };
+            if current_size < buffer_size {
+                self.recreate_vertex_buffer(buffer_size)?;
+            }
+        } else {
+            self.recreate_vertex_buffer(buffer_size)?;
+        }
+
+        if let Some(ref buffer) = self.vertex_buffer {
+            unsafe {
+                let data_ptr = buffer.allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+                let vertex_bytes = bytemuck::cast_slice(&self.vertices);
+                std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), data_ptr, vertex_bytes.len());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn recreate_vertex_buffer(
+        &mut self,
+        size: vk::DeviceSize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(old_buffer) = self.vertex_buffer.take() {
+            if let Some(allocator_arc) = &self.allocator {
+                if let Ok(mut alloc) = allocator_arc.lock() {
+                    unsafe {
+                        self.device.destroy_buffer(old_buffer.buffer, None);
+                    }
+                    let _ = alloc.free(old_buffer.allocation);
+                }
+            }
+        }
+
+        let allocator = self.allocator.as_ref().ok_or("Allocator not available")?;
+        let new_buffer = create_vertex_buffer_with_size(&self.device, allocator, size)?;
+        self.vertex_buffer = Some(new_buffer);
+
+        update_descriptor_sets(
+            &self.device,
+            &self.descriptor_sets,
+            self.vertex_buffer.as_ref().unwrap(),
+        )?;
+
+        Ok(())
+    }
+
+    fn update_index_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.indices.is_empty() {
+            return Ok(());
+        }
+
+        let buffer_size = (std::mem::size_of::<u32>() * self.indices.len()) as vk::DeviceSize;
+
+        if let Some(ref buffer) = self.index_buffer {
+            let current_size = unsafe {
+                self.device
+                    .get_buffer_memory_requirements(buffer.buffer)
+                    .size
+            };
+            if current_size < buffer_size {
+                self.recreate_index_buffer(buffer_size)?;
+            }
+        } else {
+            self.recreate_index_buffer(buffer_size)?;
+        }
+
+        if let Some(ref buffer) = self.index_buffer {
+            unsafe {
+                let data_ptr = buffer.allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+                let index_bytes = bytemuck::cast_slice(&self.indices);
+                std::ptr::copy_nonoverlapping(index_bytes.as_ptr(), data_ptr, index_bytes.len());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn recreate_index_buffer(
+        &mut self,
+        size: vk::DeviceSize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(old_buffer) = self.index_buffer.take() {
+            if let Some(allocator_arc) = &self.allocator {
+                if let Ok(mut alloc) = allocator_arc.lock() {
+                    unsafe {
+                        self.device.destroy_buffer(old_buffer.buffer, None);
+                    }
+                    let _ = alloc.free(old_buffer.allocation);
+                }
+            }
+        }
+
+        let allocator = self.allocator.as_ref().ok_or("Allocator not available")?;
+        let new_buffer = create_index_buffer_with_size(&self.device, allocator, size)?;
+        self.index_buffer = Some(new_buffer);
+
+        Ok(())
+    }
+
+    fn update_object_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.objects.is_empty() {
+            return Ok(());
+        }
+
+        let gpu_objects: Vec<Object> = self
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(index, obj_data)| Object {
+                position: [
+                    obj_data.position[0],
+                    obj_data.position[1],
+                    obj_data.position[2],
+                    1.0,
+                ],
+                mesh_index: obj_data.mesh_id.0 as u32,
+                material_index: obj_data.material_index,
+                padding1: 0,
+                padding2: 0,
+            })
+            .collect();
+
+        let buffer_size = (std::mem::size_of::<Object>() * gpu_objects.len()) as vk::DeviceSize;
+
+        if let Some(ref buffer) = self.object_buffer {
+            let current_size = unsafe {
+                self.device
+                    .get_buffer_memory_requirements(buffer.buffer)
+                    .size
+            };
+            if current_size < buffer_size {
+                self.recreate_object_buffer(buffer_size)?;
+            }
+        } else {
+            self.recreate_object_buffer(buffer_size)?;
+        }
+
+        if let Some(ref buffer) = self.object_buffer {
+            unsafe {
+                let data_ptr = buffer.allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+                let object_bytes = bytemuck::cast_slice(&gpu_objects);
+                std::ptr::copy_nonoverlapping(object_bytes.as_ptr(), data_ptr, object_bytes.len());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn recreate_object_buffer(
+        &mut self,
+        size: vk::DeviceSize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(old_buffer) = self.object_buffer.take() {
+            if let Some(allocator_arc) = &self.allocator {
+                if let Ok(mut alloc) = allocator_arc.lock() {
+                    unsafe {
+                        self.device.destroy_buffer(old_buffer.buffer, None);
+                    }
+                    let _ = alloc.free(old_buffer.allocation);
+                }
+            }
+        }
+
+        let allocator = self.allocator.as_ref().ok_or("Allocator not available")?;
+        let new_buffer = create_object_buffer_with_size(&self.device, allocator, size)?;
+        self.object_buffer = Some(new_buffer);
+
+        update_compute_descriptor_sets(
+            &self.device,
+            &self.compute_descriptor_sets,
+            self.indirect_buffer.as_ref().unwrap(),
+            self.count_buffer.as_ref().unwrap(),
+            self.object_buffer.as_ref().unwrap(),
+        )?;
+
+        Ok(())
+    }
 }
 
 impl Drop for Renderer {
@@ -284,6 +639,11 @@ impl Drop for Renderer {
                             self.device.destroy_buffer(count_buffer.buffer, None);
                             let _ = alloc.free(count_buffer.allocation);
                         }
+
+                        if let Some(object_buffer) = self.object_buffer.take() {
+                            self.device.destroy_buffer(object_buffer.buffer, None);
+                            let _ = alloc.free(object_buffer.allocation);
+                        }
                     }
                     Err(_) => log::error!("Failed to lock allocator"),
                 }
@@ -311,6 +671,14 @@ impl Drop for Renderer {
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
+            self.device.destroy_pipeline(self.compute_pipeline, None);
+
+            self.device
+                .destroy_pipeline_layout(self.compute_pipeline_layout, None);
+
+            self.device
+                .destroy_descriptor_set_layout(self.compute_descriptor_set_layout, None);
+
             self.allocator = None;
 
             self.device.destroy_command_pool(self.command_pool, None);
@@ -334,6 +702,88 @@ struct Swapchain {
     pub format: vk::SurfaceFormatKHR,
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
+}
+
+fn setup_sample_scene(renderer: &mut Renderer) {
+    let triangle1_vertices = [
+        Vertex {
+            position: [-0.5, 0.5, -1.0],
+            color: [1.0, 0.0, 0.0],
+        },
+        Vertex {
+            position: [0.5, 0.5, -1.0],
+            color: [1.0, 0.0, 0.0],
+        },
+        Vertex {
+            position: [0.0, -0.5, -1.0],
+            color: [1.0, 0.0, 0.0],
+        },
+    ];
+    let triangle1_indices = [0, 1, 2];
+
+    let triangle2_vertices = [
+        Vertex {
+            position: [0.5, 0.5, -2.0],
+            color: [0.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [1.5, 0.5, -2.0],
+            color: [0.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [1.0, -0.5, -2.0],
+            color: [0.0, 1.0, 0.0],
+        },
+    ];
+    let triangle2_indices = [0, 1, 2];
+
+    let triangle3_vertices = [
+        Vertex {
+            position: [-0.5, 1.5, -3.0],
+            color: [0.0, 0.0, 1.0],
+        },
+        Vertex {
+            position: [0.5, 1.5, -3.0],
+            color: [0.0, 0.0, 1.0],
+        },
+        Vertex {
+            position: [0.0, 0.5, -3.0],
+            color: [0.0, 0.0, 1.0],
+        },
+    ];
+    let triangle3_indices = [0, 1, 2];
+
+    let triangle4_vertices = [
+        Vertex {
+            position: [-1.5, 0.5, -0.5],
+            color: [1.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [-0.5, 0.5, -0.5],
+            color: [1.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [-1.0, -0.5, -0.5],
+            color: [1.0, 1.0, 0.0],
+        },
+    ];
+    let triangle4_indices = [0, 1, 2];
+
+    if let Ok(mesh1) = renderer.add_mesh(&triangle1_vertices, &triangle1_indices) {
+        let _ = renderer.add_object(mesh1, [0.0, 0.0, -1.0], 0);
+    }
+
+    if let Ok(mesh2) = renderer.add_mesh(&triangle2_vertices, &triangle2_indices) {
+        let _ = renderer.add_object(mesh2, [1.0, 0.0, -2.0], 0);
+    }
+
+    if let Ok(mesh3) = renderer.add_mesh(&triangle3_vertices, &triangle3_indices) {
+        let _ = renderer.add_object(mesh3, [0.0, 1.0, -3.0], 0);
+    }
+
+    if let Ok(mesh4) = renderer.add_mesh(&triangle4_vertices, &triangle4_indices) {
+        let _ = renderer.add_object(mesh4, [-1.0, 0.0, -0.5], 0);
+    }
 }
 
 fn find_depth_format(
@@ -476,25 +926,35 @@ where
     let (depth_image, depth_image_view) =
         create_depth_buffer(&device, &allocator, swapchain.extent, depth_format)?;
 
-    let vertex_buffer = create_vertex_buffer(&device, &allocator)?;
+    let vertex_buffer = create_vertex_buffer_with_size(&device, &allocator, 1024 * 1024)?;
+    let index_buffer = create_index_buffer_with_size(&device, &allocator, 256 * 1024)?;
 
-    let index_buffer = create_index_buffer(&device, &allocator)?;
-
-    let indirect_buffer = create_indirect_buffer(&device, &allocator)?;
-
+    const MAX_DRAW_COMMANDS: usize = 64;
+    let indirect_buffer = create_indirect_buffer(&device, &allocator, MAX_DRAW_COMMANDS)?;
     let count_buffer = create_count_buffer(&device, &allocator)?;
+    let object_buffer = create_object_buffer_with_size(&device, &allocator, 64 * 1024)?;
 
     let descriptor_set_layout = create_descriptor_set_layout(&device)?;
-
     let descriptor_pool = create_descriptor_pool(&device)?;
-
     let descriptor_sets =
         allocate_descriptor_sets(&device, descriptor_pool, descriptor_set_layout)?;
-
     update_descriptor_sets(&device, &descriptor_sets, &vertex_buffer)?;
 
     let (pipeline_layout, pipeline) =
         create_pipeline(&device, &swapchain, descriptor_set_layout, depth_format)?;
+
+    let compute_descriptor_set_layout = create_compute_descriptor_set_layout(&device)?;
+    let compute_descriptor_sets = allocate_compute_descriptor_sets(
+        &device,
+        descriptor_pool,
+        compute_descriptor_set_layout,
+        &indirect_buffer,
+        &count_buffer,
+        &object_buffer,
+    )?;
+
+    let (compute_pipeline_layout, compute_pipeline) =
+        create_compute_pipeline(&device, compute_descriptor_set_layout)?;
 
     let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
         allocator.clone(),
@@ -557,14 +1017,19 @@ where
         depth_format,
         pipeline,
         pipeline_layout,
+        compute_pipeline,
+        compute_pipeline_layout,
         command_buffers: vec![],
         vertex_buffer: Some(vertex_buffer),
         index_buffer: Some(index_buffer),
         indirect_buffer: Some(indirect_buffer),
         count_buffer: Some(count_buffer),
+        object_buffer: Some(object_buffer),
         descriptor_set_layout,
         descriptor_pool,
         descriptor_sets,
+        compute_descriptor_set_layout,
+        compute_descriptor_sets,
         image_available_semaphores,
         render_finished_semaphores,
         in_flight_fences,
@@ -573,71 +1038,28 @@ where
         frames_in_flight: FRAMES_IN_FLIGHT,
         is_swapchain_dirty: false,
         egui_renderer: Some(egui_renderer),
+
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        meshes: Vec::new(),
+        objects: Vec::new(),
+        next_mesh_id: 0,
+        next_object_id: 0,
+        buffers_dirty: false,
     };
+
     renderer.command_buffers = create_and_record_command_buffers(&renderer)?;
 
     Ok(renderer)
 }
 
-fn create_vertex_buffer(
+fn create_vertex_buffer_with_size(
     device: &ash::Device,
     allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    size: vk::DeviceSize,
 ) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
-    let vertices = [
-        Vertex {
-            position: [-0.5, 0.5, -1.0],
-            color: [1.0, 0.0, 0.0],
-        },
-        Vertex {
-            position: [0.5, 0.5, -1.0],
-            color: [1.0, 0.0, 0.0],
-        },
-        Vertex {
-            position: [0.0, -0.5, -1.0],
-            color: [1.0, 0.0, 0.0],
-        },
-        Vertex {
-            position: [0.5, 0.5, -2.0],
-            color: [0.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [1.5, 0.5, -2.0],
-            color: [0.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [1.0, -0.5, -2.0],
-            color: [0.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [-0.5, 1.5, -3.0],
-            color: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            position: [0.5, 1.5, -3.0],
-            color: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            position: [0.0, 0.5, -3.0],
-            color: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            position: [-1.5, 0.5, -0.5],
-            color: [1.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [-0.5, 0.5, -0.5],
-            color: [1.0, 1.0, 0.0],
-        },
-        Vertex {
-            position: [-1.0, -0.5, -0.5],
-            color: [1.0, 1.0, 0.0],
-        },
-    ];
-
-    let buffer_size = std::mem::size_of_val(&vertices) as vk::DeviceSize;
-
     let buffer_info = vk::BufferCreateInfo::default()
-        .size(buffer_size)
+        .size(size)
         .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -658,25 +1080,16 @@ fn create_vertex_buffer(
         device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
     }
 
-    unsafe {
-        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
-        let vertex_bytes = bytemuck::cast_slice(&vertices);
-        std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), data_ptr, vertex_bytes.len());
-    }
-
     Ok(BufferAllocation { buffer, allocation })
 }
 
-fn create_index_buffer(
+fn create_index_buffer_with_size(
     device: &ash::Device,
     allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    size: vk::DeviceSize,
 ) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
-    let indices: [u32; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-
-    let buffer_size = std::mem::size_of_val(&indices) as vk::DeviceSize;
-
     let buffer_info = vk::BufferCreateInfo::default()
-        .size(buffer_size)
+        .size(size)
         .usage(vk::BufferUsageFlags::INDEX_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -697,61 +1110,23 @@ fn create_index_buffer(
         device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
     }
 
-    unsafe {
-        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
-        let index_bytes = bytemuck::cast_slice(&indices);
-        std::ptr::copy_nonoverlapping(index_bytes.as_ptr(), data_ptr, index_bytes.len());
-    }
-
     Ok(BufferAllocation { buffer, allocation })
 }
 
-fn create_indirect_buffer(
+fn create_object_buffer_with_size(
     device: &ash::Device,
     allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    size: vk::DeviceSize,
 ) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
-    let draw_commands = [
-        DrawCommand {
-            index_count: 3,
-            instance_count: 1,
-            first_index: 0,
-            vertex_offset: 0,
-            first_instance: 0,
-        },
-        DrawCommand {
-            index_count: 3,
-            instance_count: 1,
-            first_index: 3,
-            vertex_offset: 0,
-            first_instance: 0,
-        },
-        DrawCommand {
-            index_count: 3,
-            instance_count: 1,
-            first_index: 6,
-            vertex_offset: 0,
-            first_instance: 0,
-        },
-        DrawCommand {
-            index_count: 3,
-            instance_count: 1,
-            first_index: 9,
-            vertex_offset: 0,
-            first_instance: 0,
-        },
-    ];
-
-    let buffer_size = std::mem::size_of_val(&draw_commands) as vk::DeviceSize;
-
     let buffer_info = vk::BufferCreateInfo::default()
-        .size(buffer_size)
-        .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
+        .size(size)
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
 
     let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
-        name: "Indirect Buffer",
+        name: "Object Buffer",
         requirements: unsafe { device.get_buffer_memory_requirements(buffer) },
         location: gpu_allocator::MemoryLocation::CpuToGpu,
         linear: true,
@@ -765,10 +1140,40 @@ fn create_indirect_buffer(
         device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
     }
 
+    Ok(BufferAllocation { buffer, allocation })
+}
+
+fn create_indirect_buffer(
+    device: &ash::Device,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    max_commands: usize,
+) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
+    let buffer_size = (std::mem::size_of::<DrawCommand>() * max_commands) as vk::DeviceSize;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(buffer_size)
+        .usage(
+            vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+
+    let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        name: "Indirect Buffer",
+        requirements: unsafe { device.get_buffer_memory_requirements(buffer) },
+        location: gpu_allocator::MemoryLocation::GpuOnly,
+        linear: true,
+        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+    };
+
+    let mut allocator = allocator.lock().unwrap();
+    let allocation = allocator.allocate(&allocation_create_desc)?;
+
     unsafe {
-        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
-        let command_bytes = bytemuck::cast_slice(&draw_commands);
-        std::ptr::copy_nonoverlapping(command_bytes.as_ptr(), data_ptr, command_bytes.len());
+        device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
     }
 
     Ok(BufferAllocation { buffer, allocation })
@@ -778,13 +1183,15 @@ fn create_count_buffer(
     device: &ash::Device,
     allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
 ) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
-    let count: u32 = 4;
-
     let buffer_size = std::mem::size_of::<u32>() as vk::DeviceSize;
 
     let buffer_info = vk::BufferCreateInfo::default()
         .size(buffer_size)
-        .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
+        .usage(
+            vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST,
+        )
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
@@ -792,7 +1199,7 @@ fn create_count_buffer(
     let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
         name: "Count Buffer",
         requirements: unsafe { device.get_buffer_memory_requirements(buffer) },
-        location: gpu_allocator::MemoryLocation::CpuToGpu,
+        location: gpu_allocator::MemoryLocation::GpuOnly,
         linear: true,
         allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
     };
@@ -802,12 +1209,6 @@ fn create_count_buffer(
 
     unsafe {
         device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
-    }
-
-    unsafe {
-        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
-        let count_bytes = bytemuck::bytes_of(&count);
-        std::ptr::copy_nonoverlapping(count_bytes.as_ptr(), data_ptr, count_bytes.len());
     }
 
     Ok(BufferAllocation { buffer, allocation })
@@ -832,13 +1233,13 @@ fn create_descriptor_set_layout(
 fn create_descriptor_pool(
     device: &ash::Device,
 ) -> Result<vk::DescriptorPool, Box<dyn std::error::Error>> {
-    let pool_size = vk::DescriptorPoolSize::default()
+    let pool_sizes = [vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(1);
+        .descriptor_count(4)];
 
     let create_info = vk::DescriptorPoolCreateInfo::default()
-        .pool_sizes(std::slice::from_ref(&pool_size))
-        .max_sets(1);
+        .pool_sizes(&pool_sizes)
+        .max_sets(2);
 
     let pool = unsafe { device.create_descriptor_pool(&create_info, None)? };
     Ok(pool)
@@ -876,6 +1277,53 @@ fn update_descriptor_sets(
 
     unsafe {
         device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
+    }
+
+    Ok(())
+}
+
+fn update_compute_descriptor_sets(
+    device: &ash::Device,
+    descriptor_sets: &[vk::DescriptorSet],
+    indirect_buffer: &BufferAllocation,
+    count_buffer: &BufferAllocation,
+    object_buffer: &BufferAllocation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let object_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(object_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let indirect_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(indirect_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let count_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(count_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&object_buffer_info)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&indirect_buffer_info)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&count_buffer_info)),
+    ];
+
+    unsafe {
+        device.update_descriptor_sets(&writes, &[]);
     }
 
     Ok(())
@@ -1583,6 +2031,8 @@ fn render_frame(
     ui_frame_output: Option<(egui::FullOutput, Vec<egui::ClippedPrimitive>)>,
     elapsed_time: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    renderer.update_buffers_if_dirty()?;
+
     let current_fence = renderer.in_flight_fences[renderer.current_frame];
     unsafe {
         renderer
@@ -1657,6 +2107,96 @@ fn render_frame(
             .device
             .begin_command_buffer(command_buffer, &command_buffer_begin_info)?
     };
+
+    let clear_count_value: u32 = 0;
+    unsafe {
+        renderer.device.cmd_fill_buffer(
+            command_buffer,
+            renderer.count_buffer.as_ref().unwrap().buffer,
+            0,
+            std::mem::size_of::<u32>() as vk::DeviceSize,
+            clear_count_value,
+        );
+    }
+
+    let buffer_memory_barrier = vk::BufferMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::SHADER_READ)
+        .buffer(renderer.count_buffer.as_ref().unwrap().buffer)
+        .offset(0)
+        .size(vk::WHOLE_SIZE);
+
+    let dependency_info = vk::DependencyInfo::default()
+        .buffer_memory_barriers(std::slice::from_ref(&buffer_memory_barrier));
+
+    unsafe {
+        renderer
+            .device
+            .cmd_pipeline_barrier2(command_buffer, &dependency_info);
+    }
+
+    unsafe {
+        renderer.device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            renderer.compute_pipeline,
+        );
+
+        renderer.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            renderer.compute_pipeline_layout,
+            0,
+            &renderer.compute_descriptor_sets,
+            &[],
+        );
+
+        let push_constants = ComputePushConstants {
+            object_count: renderer.objects.len() as u32,
+        };
+
+        renderer.device.cmd_push_constants(
+            command_buffer,
+            renderer.compute_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytemuck::bytes_of(&push_constants),
+        );
+
+        let workgroup_count = (renderer.objects.len() as u32 + 63) / 64;
+        renderer
+            .device
+            .cmd_dispatch(command_buffer, workgroup_count, 1, 1);
+    }
+
+    let compute_buffer_barrier = vk::BufferMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+        .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT)
+        .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ)
+        .buffer(renderer.indirect_buffer.as_ref().unwrap().buffer)
+        .offset(0)
+        .size(vk::WHOLE_SIZE);
+
+    let count_buffer_barrier = vk::BufferMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+        .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT)
+        .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ)
+        .buffer(renderer.count_buffer.as_ref().unwrap().buffer)
+        .offset(0)
+        .size(vk::WHOLE_SIZE);
+
+    let barriers = [compute_buffer_barrier, count_buffer_barrier];
+    let dependency_info = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+
+    unsafe {
+        renderer
+            .device
+            .cmd_pipeline_barrier2(command_buffer, &dependency_info);
+    }
 
     let color_image_memory_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -1794,7 +2334,7 @@ fn render_frame(
                 0,
                 count_buffer.buffer,
                 0,
-                4,
+                64,
                 std::mem::size_of::<DrawCommand>() as u32,
             );
         }
@@ -1933,4 +2473,136 @@ fn cleanup_swapchain(renderer: &mut Renderer) {
             .swapchain
             .destroy_swapchain(renderer.swapchain.swapchain_khr, None);
     }
+}
+
+fn create_compute_descriptor_set_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout, Box<dyn std::error::Error>> {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+    ];
+
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+    let layout = unsafe { device.create_descriptor_set_layout(&create_info, None)? };
+    Ok(layout)
+}
+
+fn allocate_compute_descriptor_sets(
+    device: &ash::Device,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    indirect_buffer: &BufferAllocation,
+    count_buffer: &BufferAllocation,
+    object_buffer: &BufferAllocation,
+) -> Result<Vec<vk::DescriptorSet>, Box<dyn std::error::Error>> {
+    let layouts = [descriptor_set_layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&layouts);
+
+    let descriptor_sets = unsafe { device.allocate_descriptor_sets(&allocate_info)? };
+
+    let object_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(object_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let indirect_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(indirect_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let count_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(count_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&object_buffer_info)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&indirect_buffer_info)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&count_buffer_info)),
+    ];
+
+    unsafe {
+        device.update_descriptor_sets(&writes, &[]);
+    }
+
+    Ok(descriptor_sets)
+}
+
+fn create_compute_pipeline(
+    device: &ash::Device,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error>> {
+    let push_constant_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .offset(0)
+        .size(std::mem::size_of::<ComputePushConstants>() as u32);
+
+    let set_layouts = [descriptor_set_layout];
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(std::slice::from_ref(&push_constant_range));
+
+    let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+
+    let compute_shader_code = read_shader(&include_bytes!("shaders/generate_draws.comp.spv")[..])?;
+    let compute_shader_module = {
+        let shader_module_create_info =
+            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(&compute_shader_code));
+        unsafe { device.create_shader_module(&shader_module_create_info, None)? }
+    };
+
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(compute_shader_module)
+        .name(c"main");
+
+    let compute_pipeline_info = vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(pipeline_layout);
+
+    let compute_pipeline = unsafe {
+        let pipelines = device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&compute_pipeline_info),
+                None,
+            )
+            .map_err(|e| e.1)?;
+        pipelines[0]
+    };
+
+    unsafe {
+        device.destroy_shader_module(compute_shader_module, None);
+    }
+
+    Ok((pipeline_layout, compute_pipeline))
 }

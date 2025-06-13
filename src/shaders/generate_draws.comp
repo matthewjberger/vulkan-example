@@ -1,0 +1,69 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct DrawCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+struct Object {
+    vec4 position;
+    uint meshIndex;
+    uint materialIndex;
+    uint padding1;
+    uint padding2;
+};
+
+layout(set = 0, binding = 0) readonly buffer ObjectBuffer {
+    Object objects[];
+};
+
+layout(set = 0, binding = 1) buffer DrawCommandBuffer {
+    DrawCommand drawCommands[];
+};
+
+layout(set = 0, binding = 2) buffer CountBuffer {
+    uint drawCount;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint objectCount;
+};
+
+void main() {
+    uint globalId = gl_GlobalInvocationID.x;
+    
+    if (globalId < objectCount) {
+        Object obj = objects[globalId];
+        
+        DrawCommand cmd;
+        
+        // These values will depend on the object's mesh type
+        // For now using simple values based on mesh index
+        // Each mesh has 3 indices
+        if (obj.meshIndex == 0) {
+            cmd.indexCount = 3;
+            cmd.firstIndex = 0;
+        } else if (obj.meshIndex == 1) {
+            cmd.indexCount = 3;
+            cmd.firstIndex = 3;
+        } else if (obj.meshIndex == 2) {
+            cmd.indexCount = 3;
+            cmd.firstIndex = 6;
+        } else {
+            cmd.indexCount = 3;
+            cmd.firstIndex = 9;
+        }
+        
+        cmd.instanceCount = 1;
+        cmd.vertexOffset = 0;
+        cmd.firstInstance = 0;
+        
+        uint index = atomicAdd(drawCount, 1);
+        drawCommands[index] = cmd;
+    }
+} 
