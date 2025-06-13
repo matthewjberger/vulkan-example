@@ -3,6 +3,7 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_ARB_gpu_shader_int64 : require
+#extension GL_ARB_shader_draw_parameters : require
 
 struct Vertex {
     vec4 position;
@@ -44,8 +45,11 @@ void main() {
     VertexBuffer vertexBuffer = VertexBuffer(vertexAddr);
     ObjectBuffer objectBuffer = ObjectBuffer(objectAddr);
 
+    uint drawIndex = gl_DrawID;
+    
     Vertex vertex = vertexBuffer.vertices[gl_VertexIndex];
-    Object obj = objectBuffer.objects[gl_InstanceIndex];
+    
+    Object obj = objectBuffer.objects[gl_BaseInstance + gl_InstanceIndex];
 
     inColor = obj.color.rgb;
 

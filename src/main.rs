@@ -1993,17 +1993,25 @@ fn create_device(
                 .queue_priorities(&[1.0f32])
         })
         .collect::<Vec<_>>();
+
     let device_extensions_ptrs = [
         swapchain::NAME.as_ptr(),
+        ash::khr::shader_draw_parameters::NAME.as_ptr(),
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         ash::khr::portability_subset::NAME.as_ptr(),
     ];
+
     let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true);
+
     let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
         .draw_indirect_count(true)
         .buffer_device_address(true);
+
+    let mut shader_draw_params_features =
+        vk::PhysicalDeviceShaderDrawParametersFeatures::default().shader_draw_parameters(true);
+
     let mut features = vk::PhysicalDeviceFeatures2::default()
         .features(
             vk::PhysicalDeviceFeatures::default()
@@ -2011,11 +2019,14 @@ fn create_device(
                 .shader_int64(true),
         )
         .push_next(&mut features12)
-        .push_next(&mut features13);
+        .push_next(&mut features13)
+        .push_next(&mut shader_draw_params_features);
+
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_info_list)
         .enabled_extension_names(&device_extensions_ptrs)
         .push_next(&mut features);
+
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None)? };
     Ok(device)
 }
@@ -2189,6 +2200,7 @@ fn find_vulkan_physical_device(
     }
 
     let features = get_physical_device_features(instance, physical_device);
+
     let supports_dynamic_rendering = features.vulkan13_features.dynamic_rendering == vk::TRUE;
     if !supports_dynamic_rendering {
         return Err("Physical device does not support dynamic rendering".into());
@@ -2209,6 +2221,19 @@ fn find_vulkan_physical_device(
 
     if features.device_features.multi_draw_indirect == vk::FALSE {
         return Err("Physical device does not support multi-draw indirect".into());
+    }
+
+    let shader_draw_params = unsafe {
+        let mut shader_draw_params = vk::PhysicalDeviceShaderDrawParametersFeatures::default();
+        let mut features2 =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut shader_draw_params);
+
+        instance.get_physical_device_features2(*physical_device, &mut features2);
+        shader_draw_params.shader_draw_parameters == vk::TRUE
+    };
+
+    if !shader_draw_params {
+        return Err("Physical device does not support shader draw parameters".into());
     }
 
     Ok((

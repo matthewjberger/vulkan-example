@@ -9,7 +9,7 @@ struct DrawCommand {
     uint indexCount;
     uint instanceCount;
     uint firstIndex;
-    uint vertexOffset;
+    int vertexOffset;
     uint firstInstance;
 };
 
@@ -98,7 +98,7 @@ void main() {
                 drawCommandBuffer.drawCommands[commandCount].indexCount = mesh.indexCount;
                 drawCommandBuffer.drawCommands[commandCount].instanceCount = instanceCount;
                 drawCommandBuffer.drawCommands[commandCount].firstIndex = mesh.indexOffset;
-                drawCommandBuffer.drawCommands[commandCount].vertexOffset = mesh.vertexOffset;
+                drawCommandBuffer.drawCommands[commandCount].vertexOffset = int(mesh.vertexOffset);
                 drawCommandBuffer.drawCommands[commandCount].firstInstance = currentFirstInstance;
 
                 commandCount++;
