@@ -1,4 +1,7 @@
-#version 450
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_ARB_gpu_shader_int64 : require
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
@@ -6,7 +9,7 @@ struct DrawCommand {
     uint indexCount;
     uint instanceCount;
     uint firstIndex;
-    int vertexOffset;
+    uint vertexOffset;
     uint firstInstance;
 };
 
@@ -19,36 +22,90 @@ struct Object {
     uint padding2;
 };
 
-layout(set = 0, binding = 0) readonly buffer ObjectBuffer {
+struct MeshData {
+    uint vertexOffset;
+    uint vertexCount;
+    uint indexOffset;
+    uint indexCount;
+};
+
+layout(buffer_reference, std430) readonly buffer ObjectBuffer {
     Object objects[];
 };
 
-layout(set = 0, binding = 1) buffer DrawCommandBuffer {
+layout(buffer_reference, std430) writeonly buffer DrawCommandBuffer {
     DrawCommand drawCommands[];
 };
 
-layout(set = 0, binding = 2) buffer CountBuffer {
+layout(buffer_reference, std430) writeonly buffer CountBuffer {
     uint drawCount;
+};
+
+layout(buffer_reference, std430) readonly buffer MeshBuffer {
+    MeshData meshes[];
 };
 
 layout(push_constant) uniform PushConstants {
     uint objectCount;
+    uint meshCount;
+    uvec2 vertexBufferAddress;
+    uvec2 objectBufferAddress;
+    uvec2 meshBufferAddress;
+    uvec2 indirectBufferAddress;
+    uvec2 countBufferAddress;
 };
 
 void main() {
     if (gl_GlobalInvocationID.x == 0 && gl_GlobalInvocationID.y == 0 && gl_GlobalInvocationID.z == 0) {
-        if (objectCount > 0) {
-            DrawCommand cmd;
-            cmd.indexCount = 3;
-            cmd.instanceCount = objectCount; 
-            cmd.firstIndex = 0;   
-            cmd.vertexOffset = 0;   
-            cmd.firstInstance = 0; 
-            
-            drawCommands[0] = cmd;
-            drawCount = 1;
-        } else {
-            drawCount = 0;
+        if (objectCount == 0) {
+            uint64_t countAddr = packUint2x32(countBufferAddress);
+            CountBuffer countBuffer = CountBuffer(countAddr);
+            countBuffer.drawCount = 0;
+            return;
         }
+
+        uint64_t objAddr = packUint2x32(objectBufferAddress);
+        uint64_t meshAddr = packUint2x32(meshBufferAddress);
+        uint64_t drawAddr = packUint2x32(indirectBufferAddress);
+        uint64_t countAddr = packUint2x32(countBufferAddress);
+
+        ObjectBuffer objectBuffer = ObjectBuffer(objAddr);
+        MeshBuffer meshBuffer = MeshBuffer(meshAddr);
+        DrawCommandBuffer drawCommandBuffer = DrawCommandBuffer(drawAddr);
+        CountBuffer countBuffer = CountBuffer(countAddr);
+
+        uint meshInstanceCounts[16];
+        for (uint i = 0u; i < 16u; i++) {
+            meshInstanceCounts[i] = 0u;
+        }
+
+        for (uint i = 0u; i < objectCount; i++) {
+            uint meshIndex = objectBuffer.objects[i].meshIndex;
+            if (meshIndex < 16u) {
+                meshInstanceCounts[meshIndex]++;
+            }
+        }
+
+        uint commandCount = 0u;
+        uint currentFirstInstance = 0u;
+
+        for (uint meshIndex = 0u; meshIndex < min(meshCount, 16u); meshIndex++) {
+            uint instanceCount = meshInstanceCounts[meshIndex];
+
+            if (instanceCount > 0u) {
+                MeshData mesh = meshBuffer.meshes[meshIndex];
+                
+                drawCommandBuffer.drawCommands[commandCount].indexCount = mesh.indexCount;
+                drawCommandBuffer.drawCommands[commandCount].instanceCount = instanceCount;
+                drawCommandBuffer.drawCommands[commandCount].firstIndex = mesh.indexOffset;
+                drawCommandBuffer.drawCommands[commandCount].vertexOffset = mesh.vertexOffset;
+                drawCommandBuffer.drawCommands[commandCount].firstInstance = currentFirstInstance;
+
+                commandCount++;
+                currentFirstInstance += instanceCount;
+            }
+        }
+
+        countBuffer.drawCount = commandCount;
     }
-} 
+}
