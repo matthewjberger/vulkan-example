@@ -19,4 +19,4 @@ gpu-allocator = { version = "0.27.0", features = [
 ], default-features = false }
 log = "0.4.27"
 raw-window-handle = "0.6.2"
-winit = "0.30.11"
+winit = "0.30.12"

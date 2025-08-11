@@ -182,6 +182,7 @@ struct Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
+            let _ = self.device.device_wait_idle();
             self.egui_renderer = None;
 
             for i in 0..self.frames_in_flight {
@@ -285,6 +286,8 @@ where
     let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain)?;
     log::info!("Created render pipeline and layout");
 
+    const FRAMES_IN_FLIGHT: usize = 3;
+
     let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
         allocator.clone(),
         device.clone(),
@@ -293,12 +296,10 @@ where
             depth_attachment_format: None,
         },
         egui_ash_renderer::Options {
-            in_flight_frames: 1,
+            in_flight_frames: FRAMES_IN_FLIGHT,
             ..Default::default()
         },
     )?;
-
-    const FRAMES_IN_FLIGHT: usize = 3;
 
     let image_available_semaphores = {
         let semaphore_info = vk::SemaphoreCreateInfo::default();
