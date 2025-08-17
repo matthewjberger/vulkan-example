@@ -1,0 +1,135 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 256, max_primitives = 256) out;
+
+struct Vertex {
+    vec4 position;
+    vec4 color;
+};
+
+struct Object {
+    vec4 position;
+    vec4 color;
+    uint meshIndex;
+    uint materialIndex;
+    uint padding1;
+    uint padding2;
+};
+
+struct MeshData {
+    uint vertexOffset;
+    uint vertexCount;
+    uint indexOffset;
+    uint indexCount;
+};
+
+layout(buffer_reference, std430) readonly buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(buffer_reference, std430) readonly buffer IndexBuffer {
+    uint indices[];
+};
+
+layout(buffer_reference, std430) readonly buffer ObjectBuffer {
+    Object objects[];
+};
+
+layout(buffer_reference, std430) readonly buffer MeshBuffer {
+    MeshData meshes[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint objectCount;
+    uint meshCount;
+    uvec2 vertexBufferAddress;
+    uvec2 indexBufferAddress;
+    uvec2 objectBufferAddress;
+    uvec2 meshBufferAddress;
+    uvec2 indirectBufferAddress;
+    uvec2 countBufferAddress;
+    uvec2 visibilityBufferAddress;
+    mat4 viewMatrix;
+    mat4 projectionMatrix;
+    uint enableFrustumCulling;
+    uint padding1;
+};
+
+struct MeshTaskPayload {
+    uint objectIndex;
+};
+
+taskPayloadSharedEXT MeshTaskPayload payload;
+
+layout(location = 0) out vec3 fragColor[];
+layout(location = 1) out vec3 fragNormal[];
+layout(location = 2) out vec2 fragUV[];
+
+void main() {
+    uint threadId = gl_LocalInvocationID.x;
+    uint objectIndex = payload.objectIndex;
+    
+    if (objectIndex >= objectCount) {
+        return;
+    }
+    
+    uint64_t vertexAddr = packUint2x32(vertexBufferAddress);
+    uint64_t indexAddr = packUint2x32(indexBufferAddress);
+    uint64_t objectAddr = packUint2x32(objectBufferAddress);
+    uint64_t meshAddr = packUint2x32(meshBufferAddress);
+    
+    VertexBuffer vertexBuffer = VertexBuffer(vertexAddr);
+    IndexBuffer indexBuffer = IndexBuffer(indexAddr);
+    ObjectBuffer objectBuffer = ObjectBuffer(objectAddr);
+    MeshBuffer meshBuffer = MeshBuffer(meshAddr);
+    
+    Object obj = objectBuffer.objects[objectIndex];
+    MeshData mesh = meshBuffer.meshes[obj.meshIndex];
+    
+    mat4 mvp = projectionMatrix * viewMatrix;
+    
+    uint totalVertices = min(mesh.vertexCount, 256);
+    uint totalTriangles = min(mesh.indexCount / 3, 256);
+    
+    uint verticesPerThread = (totalVertices + 31) / 32;
+    for (uint v = 0; v < verticesPerThread; v++) {
+        uint vertexId = threadId + v * 32;
+        if (vertexId < totalVertices) {
+            uint globalVertexIndex = mesh.vertexOffset + vertexId;
+            Vertex vertex = vertexBuffer.vertices[globalVertexIndex];
+            
+            vec4 worldPos = vertex.position + obj.position;
+            gl_MeshVerticesEXT[vertexId].gl_Position = mvp * worldPos;
+            
+            fragColor[vertexId] = vertex.color.rgb * obj.color.rgb;
+            fragNormal[vertexId] = vec3(0.0, 0.0, 1.0);
+            fragUV[vertexId] = vec2(0.0, 0.0);
+        }
+    }
+    
+    uint trianglesPerThread = (totalTriangles + 31) / 32;
+    for (uint t = 0; t < trianglesPerThread; t++) {
+        uint triangleId = threadId + t * 32;
+        if (triangleId < totalTriangles) {
+            uint baseIndex = triangleId * 3;
+            uint i0 = indexBuffer.indices[mesh.indexOffset + baseIndex + 0] - mesh.vertexOffset;
+            uint i1 = indexBuffer.indices[mesh.indexOffset + baseIndex + 1] - mesh.vertexOffset;
+            uint i2 = indexBuffer.indices[mesh.indexOffset + baseIndex + 2] - mesh.vertexOffset;
+            
+            i0 = min(i0, totalVertices - 1);
+            i1 = min(i1, totalVertices - 1);
+            i2 = min(i2, totalVertices - 1);
+            
+            gl_PrimitiveTriangleIndicesEXT[triangleId] = uvec3(i0, i1, i2);
+        }
+    }
+    
+    if (threadId == 0) {
+        SetMeshOutputsEXT(totalVertices, totalTriangles);
+    }
+}

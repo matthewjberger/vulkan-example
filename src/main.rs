@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use nalgebra_glm as glm;
 use std::sync::{Arc, Mutex};
 
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
@@ -310,6 +311,7 @@ struct ComputePushConstants {
     object_count: u32,
     mesh_count: u32,
     vertex_buffer_address: [u32; 2],
+    index_buffer_address: [u32; 2],
     object_buffer_address: [u32; 2],
     mesh_buffer_address: [u32; 2],
     indirect_buffer_address: [u32; 2],
@@ -319,19 +321,8 @@ struct ComputePushConstants {
     projection_matrix: [[f32; 4]; 4],
     enable_frustum_culling: u32,
     padding1: u32,
-    padding2: u32,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct GraphicsPushConstants {
-    model_matrix: [[f32; 4]; 4],
-    view_matrix: [[f32; 4]; 4],
-    projection_matrix: [[f32; 4]; 4],
-    camera_position: [f32; 4],
-    vertex_buffer_address: [u32; 2],
-    object_buffer_address: [u32; 2],
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MeshId(usize);
@@ -375,6 +366,7 @@ struct Renderer {
     pub debug_utils_messenger: vk::DebugUtilsMessengerEXT,
     pub physical_device: vk::PhysicalDevice,
     pub device: ash::Device,
+    pub mesh_shader_ext: ash::ext::mesh_shader::Device,
     pub present_queue_family_index: u32,
     pub graphics_queue_family_index: u32,
     pub _transfer_queue_family_index: Option<u32>,
@@ -387,10 +379,8 @@ struct Renderer {
     pub depth_image: Option<ImageAllocation>,
     pub depth_image_view: Option<vk::ImageView>,
     pub depth_format: vk::Format,
-    pub pipeline: vk::Pipeline,
-    pub pipeline_layout: vk::PipelineLayout,
-    pub compute_pipeline: vk::Pipeline,
-    pub compute_pipeline_layout: vk::PipelineLayout,
+    pub mesh_pipeline: vk::Pipeline,
+    pub mesh_pipeline_layout: vk::PipelineLayout,
     pub command_buffers: Vec<vk::CommandBuffer>,
     pub vertex_buffer: Option<BufferAllocation>,
     pub index_buffer: Option<BufferAllocation>,
@@ -569,7 +559,10 @@ impl Renderer {
         let index_count = indices.len() as u32;
 
         self.vertices.extend_from_slice(vertices);
-        self.indices.extend_from_slice(indices);
+        
+        for &index in indices {
+            self.indices.push(index + vertex_offset);
+        }
 
         let mesh_id = MeshId(self.next_mesh_id);
         self.next_mesh_id += 1;
@@ -580,6 +573,9 @@ impl Renderer {
             index_offset,
             index_count,
         };
+
+        log::info!("Added mesh {}: vertex_offset={}, vertex_count={}, index_offset={}, index_count={}", 
+                   self.next_mesh_id, vertex_offset, vertex_count, index_offset, index_count);
 
         self.meshes.push(mesh_data);
         self.buffers_dirty = true;
@@ -973,12 +969,9 @@ impl Drop for Renderer {
 
             let _ = self.device.device_wait_idle();
 
-            self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline(self.mesh_pipeline, None);
             self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_pipeline(self.compute_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.compute_pipeline_layout, None);
+                .destroy_pipeline_layout(self.mesh_pipeline_layout, None);
 
             self.allocator = None;
             self.device.destroy_command_pool(self.command_pool, None);
@@ -1158,6 +1151,7 @@ where
     }
     queue_indices.dedup();
     let device = create_device(&instance, physical_device, &queue_indices)?;
+    let mesh_shader_ext = ash::ext::mesh_shader::Device::new(&instance, &device);
 
     let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family_index, 0) };
     let present_queue = unsafe { device.get_device_queue(present_queue_family_index, 0) };
@@ -1193,8 +1187,7 @@ where
     let count_buffer = create_count_buffer(&device, &allocator)?;
     let object_buffer = create_object_buffer_with_size(&device, &allocator, 32 * 1024 * 1024)?;
 
-    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, depth_format)?;
-    let (compute_pipeline_layout, compute_pipeline) = create_compute_pipeline(&device)?;
+    let (mesh_pipeline_layout, mesh_pipeline) = create_mesh_pipeline(&device, &swapchain, depth_format)?;
 
     let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
         allocator.clone(),
@@ -1245,6 +1238,7 @@ where
         debug_utils_messenger,
         physical_device,
         device,
+        mesh_shader_ext,
         present_queue_family_index,
         graphics_queue_family_index,
         _transfer_queue_family_index: transfer_queue_family_index,
@@ -1257,10 +1251,8 @@ where
         depth_image: Some(depth_image),
         depth_image_view: Some(depth_image_view),
         depth_format,
-        pipeline,
-        pipeline_layout,
-        compute_pipeline,
-        compute_pipeline_layout,
+        mesh_pipeline,
+        mesh_pipeline_layout,
         command_buffers: vec![],
         vertex_buffer: Some(vertex_buffer),
         index_buffer: Some(index_buffer),
@@ -1577,47 +1569,65 @@ fn create_visibility_buffer(
     })
 }
 
-fn create_pipeline(
+fn create_mesh_pipeline(
     device: &ash::Device,
     swapchain: &Swapchain,
     depth_format: vk::Format,
-) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error + 'static>> {
+) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error>> {
     let push_constant_range = vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .stage_flags(vk::ShaderStageFlags::TASK_EXT | vk::ShaderStageFlags::MESH_EXT)
         .offset(0)
-        .size(std::mem::size_of::<GraphicsPushConstants>() as u32);
+        .size(200);
 
     let layout_info = vk::PipelineLayoutCreateInfo::default()
         .push_constant_ranges(std::slice::from_ref(&push_constant_range));
 
-    let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
-    let entry_point_name = c"main";
-    let vertex_source = read_shader(&include_bytes!("shaders/triangle.vert.spv")[..])?;
-    let vertex_create_info = vk::ShaderModuleCreateInfo::default().code(&vertex_source);
-    let vertex_module = unsafe { device.create_shader_module(&vertex_create_info, None)? };
-    let fragment_source = read_shader(&include_bytes!("shaders/triangle.frag.spv")[..])?;
-    let fragment_create_info = vk::ShaderModuleCreateInfo::default().code(&fragment_source);
-    let fragment_module = unsafe { device.create_shader_module(&fragment_create_info, None)? };
-    let shader_states_infos = [
+    let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+
+    let task_shader_code = read_shader(&include_bytes!("shaders/mesh.task.spv")[..])?;
+    let task_shader_module = {
+        let shader_module_create_info =
+            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(&task_shader_code));
+        unsafe { device.create_shader_module(&shader_module_create_info, None)? }
+    };
+
+    let mesh_shader_code = read_shader(&include_bytes!("shaders/mesh.mesh.spv")[..])?;
+    let mesh_shader_module = {
+        let shader_module_create_info =
+            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(&mesh_shader_code));
+        unsafe { device.create_shader_module(&shader_module_create_info, None)? }
+    };
+
+    let fragment_shader_code = read_shader(&include_bytes!("shaders/triangle.frag.spv")[..])?;
+    let fragment_shader_module = {
+        let shader_module_create_info =
+            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(&fragment_shader_code));
+        unsafe { device.create_shader_module(&shader_module_create_info, None)? }
+    };
+
+    let main_function_name = c"main";
+    
+    let shader_stages = [
         vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vertex_module)
-            .name(entry_point_name),
+            .stage(vk::ShaderStageFlags::TASK_EXT)
+            .module(task_shader_module)
+            .name(main_function_name),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::MESH_EXT)
+            .module(mesh_shader_module)
+            .name(main_function_name),
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(fragment_module)
-            .name(entry_point_name),
+            .module(fragment_shader_module)
+            .name(main_function_name),
     ];
-    let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
-    let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-        .primitive_restart_enable(false);
+
     let extent = swapchain.extent;
     let viewports = [vk::Viewport {
         x: 0.0,
         y: 0.0,
-        width: extent.width as _,
-        height: extent.height as _,
+        width: extent.width as f32,
+        height: extent.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }];
@@ -1628,6 +1638,7 @@ fn create_pipeline(
     let viewport_info = vk::PipelineViewportStateCreateInfo::default()
         .viewports(&viewports)
         .scissors(&scissors);
+
     let rasterizer_info = vk::PipelineRasterizationStateCreateInfo::default()
         .depth_clamp_enable(false)
         .rasterizer_discard_enable(false)
@@ -1635,16 +1646,11 @@ fn create_pipeline(
         .line_width(1.0)
         .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-        .depth_bias_enable(false)
-        .depth_bias_constant_factor(0.0)
-        .depth_bias_clamp(0.0)
-        .depth_bias_slope_factor(0.0);
+        .depth_bias_enable(false);
+
     let multisampling_info = vk::PipelineMultisampleStateCreateInfo::default()
         .sample_shading_enable(false)
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-        .min_sample_shading(1.0)
-        .alpha_to_coverage_enable(false)
-        .alpha_to_one_enable(false);
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
     let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
@@ -1655,26 +1661,19 @@ fn create_pipeline(
 
     let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(vk::ColorComponentFlags::RGBA)
-        .blend_enable(false)
-        .src_color_blend_factor(vk::BlendFactor::ONE)
-        .dst_color_blend_factor(vk::BlendFactor::ZERO)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .alpha_blend_op(vk::BlendOp::ADD)];
+        .blend_enable(false)];
+
     let color_blending_info = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op_enable(false)
-        .logic_op(vk::LogicOp::COPY)
-        .attachments(&color_blend_attachments)
-        .blend_constants([0.0, 0.0, 0.0, 0.0]);
+        .attachments(&color_blend_attachments);
+
     let color_attachment_formats = [swapchain.format.format];
     let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&color_attachment_formats)
         .depth_attachment_format(depth_format);
+
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-        .stages(&shader_states_infos)
-        .vertex_input_state(&vertex_input_info)
-        .input_assembly_state(&input_assembly_info)
+        .stages(&shader_stages)
         .viewport_state(&viewport_info)
         .rasterization_state(&rasterizer_info)
         .multisample_state(&multisampling_info)
@@ -1682,6 +1681,7 @@ fn create_pipeline(
         .color_blend_state(&color_blending_info)
         .layout(pipeline_layout)
         .push_next(&mut rendering_info);
+
     let pipeline = unsafe {
         device
             .create_graphics_pipelines(
@@ -1691,101 +1691,74 @@ fn create_pipeline(
             )
             .map_err(|e| e.1)?[0]
     };
+
     unsafe {
-        device.destroy_shader_module(vertex_module, None);
-        device.destroy_shader_module(fragment_module, None);
+        device.destroy_shader_module(task_shader_module, None);
+        device.destroy_shader_module(mesh_shader_module, None);
+        device.destroy_shader_module(fragment_shader_module, None);
     }
+
     Ok((pipeline_layout, pipeline))
 }
 
-fn create_push_constants(
+
+fn create_compute_push_constants_for_mesh(
+    renderer: &Renderer,
     time: f32,
-    vertex_buffer_address: u64,
-    object_buffer_address: u64,
-) -> GraphicsPushConstants {
+    width: u32,
+    height: u32,
+) -> ComputePushConstants {
     let camera_pos = glm::vec3(120.0 * time.cos(), 60.0, 120.0 * time.sin());
     let target = glm::vec3(0.0, 0.0, -50.0);
     let up = glm::vec3(0.0, 1.0, 0.0);
-
     let view_matrix = glm::look_at(&camera_pos, &target, &up);
 
     let fov = 45.0_f32.to_radians();
-    let aspect = 4.0 / 3.0;
+    let aspect = width as f32 / height as f32;
     let near = 0.1;
     let far = 500.0;
     let projection_matrix = glm::perspective(aspect, fov, near, far);
 
-    let rotation_speed = 0.2;
-    let angle = time * rotation_speed;
-    let model_matrix = glm::rotate(&glm::Mat4::identity(), angle, &glm::vec3(0.0, 1.0, 0.0));
-
-    let camera_position = [camera_pos.x, camera_pos.y, camera_pos.z, 1.0];
-
-    let vertex_buffer_address_split = [
-        vertex_buffer_address as u32,
-        (vertex_buffer_address >> 32) as u32,
-    ];
-    let object_buffer_address_split = [
-        object_buffer_address as u32,
-        (object_buffer_address >> 32) as u32,
-    ];
-
-    GraphicsPushConstants {
-        model_matrix: model_matrix.into(),
+    ComputePushConstants {
+        object_count: renderer.objects.len() as u32,
+        mesh_count: renderer.meshes.len() as u32,
+        vertex_buffer_address: [
+            renderer.vertex_buffer.as_ref().unwrap().device_address.unwrap() as u32,
+            (renderer.vertex_buffer.as_ref().unwrap().device_address.unwrap() >> 32) as u32,
+        ],
+        index_buffer_address: [
+            renderer.index_buffer.as_ref().unwrap().device_address.unwrap() as u32,
+            (renderer.index_buffer.as_ref().unwrap().device_address.unwrap() >> 32) as u32,
+        ],
+        object_buffer_address: [
+            renderer.object_buffer.as_ref().unwrap().device_address.unwrap() as u32,
+            (renderer.object_buffer.as_ref().unwrap().device_address.unwrap() >> 32) as u32,
+        ],
+        mesh_buffer_address: [
+            renderer.mesh_buffer.as_ref().unwrap().device_address.unwrap() as u32,
+            (renderer.mesh_buffer.as_ref().unwrap().device_address.unwrap() >> 32) as u32,
+        ],
+        indirect_buffer_address: [
+            renderer.indirect_buffer.as_ref().unwrap().device_address.unwrap() as u32,
+            (renderer.indirect_buffer.as_ref().unwrap().device_address.unwrap() >> 32) as u32,
+        ],
+        count_buffer_address: [
+            renderer.count_buffer.as_ref().unwrap().device_address.unwrap() as u32,
+            (renderer.count_buffer.as_ref().unwrap().device_address.unwrap() >> 32) as u32,
+        ],
+        visibility_buffer_address: [
+            renderer.visibility_buffer.as_ref().unwrap().device_address.unwrap() as u32,
+            (renderer.visibility_buffer.as_ref().unwrap().device_address.unwrap() >> 32) as u32,
+        ],
         view_matrix: view_matrix.into(),
         projection_matrix: projection_matrix.into(),
-        camera_position,
-        vertex_buffer_address: vertex_buffer_address_split,
-        object_buffer_address: object_buffer_address_split,
+        enable_frustum_culling: if renderer.enable_frustum_culling { 1 } else { 0 },
+        padding1: 0,
     }
 }
 
-fn create_compute_pipeline(
-    device: &ash::Device,
-) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error>> {
-    let push_constant_range = vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        .offset(0)
-        .size(204);
 
-    let layout_info = vk::PipelineLayoutCreateInfo::default()
-        .push_constant_ranges(std::slice::from_ref(&push_constant_range));
 
-    let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
-
-    let compute_shader_code = read_shader(&include_bytes!("shaders/generate_draws.comp.spv")[..])?;
-    let compute_shader_module = {
-        let shader_module_create_info =
-            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(&compute_shader_code));
-        unsafe { device.create_shader_module(&shader_module_create_info, None)? }
-    };
-
-    let stage = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(compute_shader_module)
-        .name(c"main");
-
-    let compute_pipeline_info = vk::ComputePipelineCreateInfo::default()
-        .stage(stage)
-        .layout(pipeline_layout);
-
-    let compute_pipeline = unsafe {
-        let pipelines = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                std::slice::from_ref(&compute_pipeline_info),
-                None,
-            )
-            .map_err(|e| e.1)?;
-        pipelines[0]
-    };
-
-    unsafe {
-        device.destroy_shader_module(compute_shader_module, None);
-    }
-
-    Ok((pipeline_layout, compute_pipeline))
-}
 
 fn render_frame(
     renderer: &mut Renderer,
@@ -1883,153 +1856,6 @@ fn render_frame(
             .begin_command_buffer(command_buffer, &command_buffer_begin_info)?;
     }
 
-    unsafe {
-        renderer.device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            renderer.compute_pipeline,
-        );
-
-        let camera_pos = glm::vec3(120.0 * time.cos(), 60.0, 120.0 * time.sin());
-        let target = glm::vec3(0.0, 0.0, -50.0);
-        let up = glm::vec3(0.0, 1.0, 0.0);
-        let view_matrix = glm::look_at(&camera_pos, &target, &up);
-
-        let fov = 45.0_f32.to_radians();
-        let aspect = 4.0 / 3.0;
-        let near = 0.1;
-        let far = 500.0;
-        let projection_matrix = glm::perspective(aspect, fov, near, far);
-
-        let compute_push_constants = ComputePushConstants {
-            object_count: renderer.objects.len() as u32,
-            mesh_count: renderer.meshes.len() as u32,
-            vertex_buffer_address: [
-                renderer
-                    .vertex_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap() as u32,
-                (renderer
-                    .vertex_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap()
-                    >> 32) as u32,
-            ],
-            object_buffer_address: [
-                renderer
-                    .object_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap() as u32,
-                (renderer
-                    .object_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap()
-                    >> 32) as u32,
-            ],
-            mesh_buffer_address: [
-                renderer
-                    .mesh_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap() as u32,
-                (renderer
-                    .mesh_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap()
-                    >> 32) as u32,
-            ],
-            indirect_buffer_address: [
-                renderer
-                    .indirect_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap() as u32,
-                (renderer
-                    .indirect_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap()
-                    >> 32) as u32,
-            ],
-            count_buffer_address: [
-                renderer
-                    .count_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap() as u32,
-                (renderer
-                    .count_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap()
-                    >> 32) as u32,
-            ],
-            visibility_buffer_address: [
-                renderer
-                    .visibility_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap() as u32,
-                (renderer
-                    .visibility_buffer
-                    .as_ref()
-                    .unwrap()
-                    .device_address
-                    .unwrap()
-                    >> 32) as u32,
-            ],
-            view_matrix: view_matrix.into(),
-            projection_matrix: projection_matrix.into(),
-            enable_frustum_culling: 1,
-            padding1: 0,
-            padding2: 0,
-        };
-
-        renderer.device.cmd_push_constants(
-            command_buffer,
-            renderer.compute_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytemuck::cast_slice(&[compute_push_constants]),
-        );
-
-        let workgroup_size = 64;
-        let num_objects = renderer.objects.len() as u32;
-        let num_workgroups = (num_objects + workgroup_size - 1) / workgroup_size;
-
-        renderer
-            .device
-            .cmd_dispatch(command_buffer, num_workgroups, 1, 1);
-
-        let memory_barrier = vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT)
-            .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ);
-
-        let dependency_info =
-            vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&memory_barrier));
-
-        renderer
-            .device
-            .cmd_pipeline_barrier2(command_buffer, &dependency_info);
-    }
 
     let image_memory_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -2096,49 +1922,26 @@ fn render_frame(
         renderer.device.cmd_bind_pipeline(
             command_buffer,
             vk::PipelineBindPoint::GRAPHICS,
-            renderer.pipeline,
+            renderer.mesh_pipeline,
         );
 
-        renderer.device.cmd_bind_index_buffer(
-            command_buffer,
-            renderer.index_buffer.as_ref().unwrap().buffer,
-            0,
-            vk::IndexType::UINT32,
-        );
-
-        let graphics_push_constants = create_push_constants(
+        let compute_push_constants = create_compute_push_constants_for_mesh(
+            &renderer,
             time,
-            renderer
-                .vertex_buffer
-                .as_ref()
-                .unwrap()
-                .device_address
-                .unwrap(),
-            renderer
-                .object_buffer
-                .as_ref()
-                .unwrap()
-                .device_address
-                .unwrap(),
+            renderer.swapchain.extent.width,
+            renderer.swapchain.extent.height,
         );
 
         renderer.device.cmd_push_constants(
             command_buffer,
-            renderer.pipeline_layout,
-            vk::ShaderStageFlags::VERTEX,
+            renderer.mesh_pipeline_layout,
+            vk::ShaderStageFlags::TASK_EXT | vk::ShaderStageFlags::MESH_EXT,
             0,
-            bytemuck::cast_slice(&[graphics_push_constants]),
+            bytemuck::cast_slice(&[compute_push_constants]),
         );
 
-        renderer.device.cmd_draw_indexed_indirect_count(
-            command_buffer,
-            renderer.indirect_buffer.as_ref().unwrap().buffer,
-            0,
-            renderer.count_buffer.as_ref().unwrap().buffer,
-            0,
-            renderer.objects.len() as u32,
-            std::mem::size_of::<DrawCommand>() as u32,
-        );
+        let object_count = renderer.objects.len() as u32;
+        renderer.mesh_shader_ext.cmd_draw_mesh_tasks(command_buffer, object_count, 1, 1);
 
         if let Some(primitives) = clipped_primitives {
             if let Some(egui_renderer) = &mut renderer.egui_renderer {
@@ -2265,13 +2068,15 @@ fn create_device(
     let device_extensions_ptrs = [
         swapchain::NAME.as_ptr(),
         ash::khr::shader_draw_parameters::NAME.as_ptr(),
+        ash::ext::mesh_shader::NAME.as_ptr(),
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         ash::khr::portability_subset::NAME.as_ptr(),
     ];
 
     let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
-        .synchronization2(true);
+        .synchronization2(true)
+        .maintenance4(true);
 
     let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
         .draw_indirect_count(true)
@@ -2279,6 +2084,10 @@ fn create_device(
 
     let mut shader_draw_params_features =
         vk::PhysicalDeviceShaderDrawParametersFeatures::default().shader_draw_parameters(true);
+
+    let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+        .mesh_shader(true)
+        .task_shader(true);
 
     let mut features = vk::PhysicalDeviceFeatures2::default()
         .features(
@@ -2288,7 +2097,8 @@ fn create_device(
         )
         .push_next(&mut features12)
         .push_next(&mut features13)
-        .push_next(&mut shader_draw_params_features);
+        .push_next(&mut shader_draw_params_features)
+        .push_next(&mut mesh_shader_features);
 
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_info_list)
@@ -2410,6 +2220,7 @@ struct PhysicalDeviceFeatures {
     device_features: vk::PhysicalDeviceFeatures,
     vulkan12_features: vk::PhysicalDeviceVulkan12Features<'static>,
     vulkan13_features: vk::PhysicalDeviceVulkan13Features<'static>,
+    mesh_shader_features: vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -2504,6 +2315,19 @@ fn find_vulkan_physical_device(
         return Err("Physical device does not support shader draw parameters".into());
     }
 
+    let supports_mesh_shaders = unsafe {
+        let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut features2 =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut mesh_shader_features);
+
+        instance.get_physical_device_features2(*physical_device, &mut features2);
+        mesh_shader_features.mesh_shader == vk::TRUE && mesh_shader_features.task_shader == vk::TRUE
+    };
+
+    if !supports_mesh_shaders {
+        return Err("Physical device does not support mesh and task shaders".into());
+    }
+
     Ok((
         *physical_device,
         present_queue_family_index,
@@ -2518,9 +2342,11 @@ fn get_physical_device_features(
 ) -> PhysicalDeviceFeatures {
     let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
     let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features::default();
+    let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut vulkan12_features)
-        .push_next(&mut vulkan13_features);
+        .push_next(&mut vulkan13_features)
+        .push_next(&mut mesh_shader_features);
 
     unsafe { instance.get_physical_device_features2(*physical_device, &mut features2) };
 
@@ -2528,6 +2354,7 @@ fn get_physical_device_features(
         device_features: features2.features,
         vulkan12_features,
         vulkan13_features,
+        mesh_shader_features,
     }
 }
 
@@ -2784,10 +2611,10 @@ fn recreate_swapchain(
     cleanup_swapchain(renderer);
 
     unsafe {
-        renderer.device.destroy_pipeline(renderer.pipeline, None);
+        renderer.device.destroy_pipeline(renderer.mesh_pipeline, None);
         renderer
             .device
-            .destroy_pipeline_layout(renderer.pipeline_layout, None);
+            .destroy_pipeline_layout(renderer.mesh_pipeline_layout, None);
     }
 
     renderer.current_frame = 0;
@@ -2815,12 +2642,12 @@ fn recreate_swapchain(
         renderer.depth_image_view = Some(depth_image_view);
     }
 
-    let (pipeline_layout, pipeline) =
-        create_pipeline(&renderer.device, &swapchain, renderer.depth_format)?;
+    let (mesh_pipeline_layout, mesh_pipeline) =
+        create_mesh_pipeline(&renderer.device, &swapchain, renderer.depth_format)?;
 
     renderer.swapchain = swapchain;
-    renderer.pipeline = pipeline;
-    renderer.pipeline_layout = pipeline_layout;
+    renderer.mesh_pipeline = mesh_pipeline;
+    renderer.mesh_pipeline_layout = mesh_pipeline_layout;
 
     if let Some(allocator) = &renderer.allocator {
         if let Some(indirect_buffer) = renderer.indirect_buffer.take() {

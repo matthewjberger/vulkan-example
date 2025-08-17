@@ -1,0 +1,38 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint objectCount;
+    uint meshCount;
+    uvec2 vertexBufferAddress;
+    uvec2 indexBufferAddress;
+    uvec2 objectBufferAddress;
+    uvec2 meshBufferAddress;
+    uvec2 indirectBufferAddress;
+    uvec2 countBufferAddress;
+    uvec2 visibilityBufferAddress;
+    mat4 viewMatrix;
+    mat4 projectionMatrix;
+    uint enableFrustumCulling;
+    uint padding1;
+};
+
+struct MeshTaskPayload {
+    uint objectIndex;
+};
+
+taskPayloadSharedEXT MeshTaskPayload payload;
+
+void main() {
+    uint objectIndex = gl_WorkGroupID.x;
+    
+    if (objectIndex >= objectCount) {
+        return;
+    }
+    
+    payload.objectIndex = objectIndex;
+    
+    EmitMeshTasksEXT(1, 1, 1);
+}
