@@ -67,73 +67,69 @@ impl winit::application::ApplicationHandler for Context {
 
         if let winit::event::WindowEvent::Resized(winit::dpi::PhysicalSize { width, height }) =
             event
+            && width > 0
+            && height > 0
         {
-            if width > 0 && height > 0 {
-                if let Some(gui_state) = &mut self.egui_state
-                    && let Some(window) = self.window_handle.as_ref()
-                {
-                    gui_state
-                        .egui_ctx()
-                        .set_pixels_per_point(window.scale_factor() as _);
-                }
-
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.is_swapchain_dirty = true;
-                }
+            if let Some(gui_state) = &mut self.egui_state
+                && let Some(window) = self.window_handle.as_ref()
+            {
+                gui_state
+                    .egui_ctx()
+                    .set_pixels_per_point(window.scale_factor() as _);
             }
-            return;
+
+            if let Some(renderer) = &mut self.renderer {
+                renderer.is_swapchain_dirty = true;
+            }
         }
-        if matches!(event, winit::event::WindowEvent::RedrawRequested) {
-            let Self {
-                window_handle: Some(window_handle),
-                renderer: Some(renderer),
-                egui_state: Some(egui_state),
-                ..
-            } = self
-            else {
-                return;
-            };
+    }
 
-            if renderer.is_swapchain_dirty {
-                let dimension = window_handle.inner_size();
-                if dimension.width > 0 && dimension.height > 0 {
-                    match recreate_swapchain(renderer, dimension.width, dimension.height) {
-                        Ok(()) => {
-                            renderer.is_swapchain_dirty = false;
-                        }
-                        Err(error) => {
-                            log::error!("Failed to recreate swapchain: {error}");
-                            return;
-                        }
+    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        let Self {
+            window_handle: Some(window_handle),
+            renderer: Some(renderer),
+            egui_state: Some(egui_state),
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        if renderer.is_swapchain_dirty {
+            let dimension = window_handle.inner_size();
+            if dimension.width > 0 && dimension.height > 0 {
+                match recreate_swapchain(renderer, dimension.width, dimension.height) {
+                    Ok(()) => {
+                        renderer.is_swapchain_dirty = false;
                     }
-                } else {
-                    return;
+                    Err(error) => {
+                        log::error!("Failed to recreate swapchain: {error}");
+                        return;
+                    }
                 }
+            } else {
+                return;
             }
+        }
 
-            let gui_input = egui_state.take_egui_input(window_handle);
-            egui_state.egui_ctx().begin_pass(gui_input);
-            let egui_ctx = egui_state.egui_ctx().clone();
-            egui::Window::new("Hello World").show(&egui_ctx, |ui| {
-                ui.heading("Hello World");
-            });
-            let output = egui_state.egui_ctx().end_pass();
-            egui_state.handle_platform_output(window_handle, output.platform_output.clone());
-            let paint_jobs = egui_ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
-            let ui_frame_output = Some((output, paint_jobs));
+        let gui_input = egui_state.take_egui_input(window_handle);
+        egui_state.egui_ctx().begin_pass(gui_input);
+        let egui_ctx = egui_state.egui_ctx().clone();
+        egui::Window::new("Hello World").show(&egui_ctx, |ui| {
+            ui.heading("Hello World");
+        });
+        let output = egui_state.egui_ctx().end_pass();
+        egui_state.handle_platform_output(window_handle, output.platform_output.clone());
+        let paint_jobs = egui_ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
+        let ui_frame_output = Some((output, paint_jobs));
 
-            let should_render =
-                window_handle.inner_size().width > 0 && window_handle.inner_size().height > 0;
-            if should_render {
-                if let Err(error) = render_frame(renderer, ui_frame_output) {
-                    log::error!("Failed to draw frame: {error}");
-                } else {
-                    renderer.is_swapchain_dirty = false;
-                }
-            }
-
-            if let Some(window_handle) = self.window_handle.as_mut() {
-                window_handle.request_redraw();
+        let should_render =
+            window_handle.inner_size().width > 0 && window_handle.inner_size().height > 0;
+        if should_render {
+            if let Err(error) = render_frame(renderer, ui_frame_output) {
+                log::error!("Failed to draw frame: {error}");
+            } else {
+                renderer.is_swapchain_dirty = false;
             }
         }
     }
