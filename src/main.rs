@@ -54,10 +54,10 @@ impl winit::application::ApplicationHandler for Context {
         _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        if let Some(window) = self.window_handle.as_mut() {
-            if let Some(gui_state) = &mut self.egui_state {
-                let _consumed_event = gui_state.on_window_event(window, &event).consumed;
-            }
+        if let Some(window) = self.window_handle.as_mut()
+            && let Some(gui_state) = &mut self.egui_state
+        {
+            let _consumed_event = gui_state.on_window_event(window, &event).consumed;
         }
 
         if matches!(event, winit::event::WindowEvent::CloseRequested) {
@@ -69,12 +69,12 @@ impl winit::application::ApplicationHandler for Context {
             event
         {
             if width > 0 && height > 0 {
-                if let Some(gui_state) = &mut self.egui_state {
-                    if let Some(window) = self.window_handle.as_ref() {
-                        gui_state
-                            .egui_ctx()
-                            .set_pixels_per_point(window.scale_factor() as _);
-                    }
+                if let Some(gui_state) = &mut self.egui_state
+                    && let Some(window) = self.window_handle.as_ref()
+                {
+                    gui_state
+                        .egui_ctx()
+                        .set_pixels_per_point(window.scale_factor() as _);
                 }
 
                 if let Some(renderer) = &mut self.renderer {
@@ -772,14 +772,14 @@ fn create_allocator(
     physical_device: vk::PhysicalDevice,
     device: &ash::Device,
 ) -> Result<gpu_allocator::vulkan::Allocator, Box<dyn std::error::Error + 'static>> {
+    let mut debug_settings = gpu_allocator::AllocatorDebugSettings::default();
+    debug_settings.log_memory_information = true;
+
     let allocator_create_info = gpu_allocator::vulkan::AllocatorCreateDesc {
         instance: instance.clone(),
         device: device.clone(),
-        physical_device: physical_device,
-        debug_settings: gpu_allocator::AllocatorDebugSettings {
-            log_memory_information: true,
-            ..Default::default()
-        },
+        physical_device,
+        debug_settings,
         buffer_device_address: false,
         allocation_sizes: gpu_allocator::AllocationSizes::default(),
     };
@@ -1025,14 +1025,14 @@ fn render_frame(
 
     let (textures_delta, clipped_primitives, pixels_per_point) =
         if let Some((full_output, primitives)) = ui_frame_output {
-            if !full_output.textures_delta.set.is_empty() {
-                if let Some(egui_renderer) = &mut renderer.egui_renderer {
-                    egui_renderer.set_textures(
-                        renderer.graphics_queue,
-                        renderer.command_pool,
-                        full_output.textures_delta.set.as_slice(),
-                    )?;
-                }
+            if !full_output.textures_delta.set.is_empty()
+                && let Some(egui_renderer) = &mut renderer.egui_renderer
+            {
+                egui_renderer.set_textures(
+                    renderer.graphics_queue,
+                    renderer.command_pool,
+                    full_output.textures_delta.set.as_slice(),
+                )?;
             }
 
             (
@@ -1117,15 +1117,15 @@ fn render_frame(
     };
     unsafe { renderer.device.cmd_draw(command_buffer, 3, 1, 0, 0) };
 
-    if let Some(primitives) = clipped_primitives {
-        if let Some(egui_renderer) = &mut renderer.egui_renderer {
-            egui_renderer.cmd_draw(
-                command_buffer,
-                renderer.swapchain.extent,
-                pixels_per_point,
-                &primitives,
-            )?;
-        }
+    if let Some(primitives) = clipped_primitives
+        && let Some(egui_renderer) = &mut renderer.egui_renderer
+    {
+        egui_renderer.cmd_draw(
+            command_buffer,
+            renderer.swapchain.extent,
+            pixels_per_point,
+            &primitives,
+        )?;
     }
 
     unsafe { renderer.device.cmd_end_rendering(command_buffer) };
@@ -1206,12 +1206,11 @@ fn render_frame(
     }
     renderer.current_frame = (renderer.current_frame + 1) % renderer.frames_in_flight;
 
-    if let Some(textures_delta) = textures_delta {
-        if !textures_delta.free.is_empty() {
-            if let Some(egui_renderer) = &mut renderer.egui_renderer {
-                egui_renderer.free_textures(&textures_delta.free)?;
-            }
-        }
+    if let Some(textures_delta) = textures_delta
+        && !textures_delta.free.is_empty()
+        && let Some(egui_renderer) = &mut renderer.egui_renderer
+    {
+        egui_renderer.free_textures(&textures_delta.free)?;
     }
 
     Ok(())

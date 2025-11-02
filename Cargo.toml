@@ -6,17 +6,17 @@ edition = "2024"
 [dependencies]
 ash = "0.38.0"
 ash-window = "0.13.0"
-egui = "0.31.1"
-egui_extras = { version = "0.31.1", features = ["all_loaders"] }
-egui-ash-renderer = { version = "0.8.0", default-features = false, features = [
+egui = "0.33.0"
+egui_extras = { version = "0.33.0", features = ["all_loaders"] }
+egui-ash-renderer = { version = "0.10.0", default-features = false, features = [
     "dynamic-rendering",
     "gpu-allocator",
 ] }
-egui-winit = "0.31.1"
+egui-winit = "0.33.0"
 env_logger = "0.11.8"
-gpu-allocator = { version = "0.27.0", features = [
+gpu-allocator = { version = "0.28.0", features = [
     "vulkan",
 ], default-features = false }
-log = "0.4.27"
+log = "0.4.28"
 raw-window-handle = "0.6.2"
 winit = "0.30.12"
