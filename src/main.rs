@@ -141,6 +141,20 @@ impl winit::application::ApplicationHandler for Context {
     }
 }
 
+struct Buffer {
+    buffer: vk::Buffer,
+    allocation: Option<gpu_allocator::vulkan::Allocation>,
+    _binding_array_index: u32,
+}
+
+struct Texture {
+    image: vk::Image,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    allocation: Option<gpu_allocator::vulkan::Allocation>,
+    _binding_array_index: u32,
+}
+
 struct Renderer {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
@@ -158,6 +172,11 @@ struct Renderer {
     pub _transfer_queue: Option<vk::Queue>,
     pub command_pool: vk::CommandPool,
     pub allocator: Option<Arc<Mutex<gpu_allocator::vulkan::Allocator>>>,
+    pub bindless_descriptor_set: vk::DescriptorSet,
+    pub bindless_set_layout: vk::DescriptorSetLayout,
+    pub bindless_pool: vk::DescriptorPool,
+    pub buffers: Vec<Buffer>,
+    pub textures: Vec<Texture>,
     pub swapchain: Swapchain,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
@@ -193,6 +212,39 @@ impl Drop for Renderer {
             }
 
             cleanup_swapchain(self);
+
+            for texture in &mut self.textures {
+                self.device.destroy_sampler(texture.sampler, None);
+                self.device.destroy_image_view(texture.view, None);
+                self.device.destroy_image(texture.image, None);
+                if let Some(allocation) = texture.allocation.take() {
+                    let _ = self
+                        .allocator
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .free(allocation);
+                }
+            }
+
+            for buffer in &mut self.buffers {
+                self.device.destroy_buffer(buffer.buffer, None);
+                if let Some(allocation) = buffer.allocation.take() {
+                    let _ = self
+                        .allocator
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .free(allocation);
+                }
+            }
+
+            self.device
+                .destroy_descriptor_pool(self.bindless_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.bindless_set_layout, None);
 
             self.allocator = None;
 
@@ -279,7 +331,17 @@ where
     )?;
     log::info!("Created swapchain");
 
-    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain)?;
+    let bindless_set_layout = create_bindless_descriptor_layout(&device)?;
+    log::info!("Created bindless descriptor layout");
+
+    let bindless_pool = create_bindless_descriptor_pool(&device)?;
+    log::info!("Created bindless descriptor pool");
+
+    let bindless_descriptor_set =
+        allocate_bindless_descriptor_set(&device, bindless_pool, bindless_set_layout)?;
+    log::info!("Allocated bindless descriptor set");
+
+    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, bindless_set_layout)?;
     log::info!("Created render pipeline and layout");
 
     const FRAMES_IN_FLIGHT: usize = 3;
@@ -337,6 +399,11 @@ where
         _transfer_queue: transfer_queue,
         command_pool,
         allocator: Some(allocator),
+        bindless_descriptor_set,
+        bindless_set_layout,
+        bindless_pool,
+        buffers: vec![],
+        textures: vec![],
         swapchain,
         pipeline,
         pipeline_layout,
@@ -353,20 +420,77 @@ where
     renderer.command_buffers = create_and_record_command_buffers(&renderer)?;
     log::info!("Created and recorded command buffers");
 
+    let checkerboard_data = generate_checkerboard_texture(8);
+    renderer.create_texture(256, 256, &checkerboard_data)?;
+    log::info!("Created test checkerboard texture");
+
+    #[repr(C)]
+    struct Vertex {
+        position: [f32; 3],
+        tex_coord: [f32; 2],
+    }
+
+    let vertices = [
+        Vertex {
+            position: [-0.5, -0.5, 0.0],
+            tex_coord: [0.0, 0.0],
+        },
+        Vertex {
+            position: [0.5, 0.5, 0.0],
+            tex_coord: [1.0, 1.0],
+        },
+        Vertex {
+            position: [0.5, -0.5, 0.0],
+            tex_coord: [1.0, 0.0],
+        },
+        Vertex {
+            position: [-0.5, -0.5, 0.0],
+            tex_coord: [0.0, 0.0],
+        },
+        Vertex {
+            position: [-0.5, 0.5, 0.0],
+            tex_coord: [0.0, 1.0],
+        },
+        Vertex {
+            position: [0.5, 0.5, 0.0],
+            tex_coord: [1.0, 1.0],
+        },
+    ];
+
+    let vertex_data_size = std::mem::size_of_val(&vertices) as u64;
+    renderer.create_buffer(
+        vertex_data_size,
+        vk::BufferUsageFlags::VERTEX_BUFFER,
+        gpu_allocator::MemoryLocation::CpuToGpu,
+    )?;
+
+    let vertex_buffer_index = renderer.buffers.len() - 1;
+    renderer.upload_buffer_data(vertex_buffer_index, &vertices)?;
+
+    log::info!("Created test vertex buffer");
+
     Ok(renderer)
 }
 
 fn create_pipeline(
     device: &ash::Device,
     swapchain: &Swapchain,
+    bindless_set_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error + 'static>> {
-    let layout_info = vk::PipelineLayoutCreateInfo::default();
+    let descriptor_set_layouts = [bindless_set_layout];
+    let push_constant_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(4);
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&descriptor_set_layouts)
+        .push_constant_ranges(std::slice::from_ref(&push_constant_range));
     let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
     let entry_point_name = c"main";
-    let vertex_source = read_shader(&include_bytes!("shaders/triangle.vert.spv")[..])?;
+    let vertex_source = read_shader(&include_bytes!("shaders/quad.vert.spv")[..])?;
     let vertex_create_info = vk::ShaderModuleCreateInfo::default().code(&vertex_source);
     let vertex_module = unsafe { device.create_shader_module(&vertex_create_info, None)? };
-    let fragment_source = read_shader(&include_bytes!("shaders/triangle.frag.spv")[..])?;
+    let fragment_source = read_shader(&include_bytes!("shaders/quad.frag.spv")[..])?;
     let fragment_create_info = vk::ShaderModuleCreateInfo::default().code(&fragment_source);
     let fragment_module = unsafe { device.create_shader_module(&fragment_create_info, None)? };
     let shader_states_infos = [
@@ -379,7 +503,25 @@ fn create_pipeline(
             .module(fragment_module)
             .name(entry_point_name),
     ];
-    let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+    let vertex_binding_descriptions = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(20)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+    let vertex_attribute_descriptions = [
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(0)
+            .format(vk::Format::R32G32B32_SFLOAT)
+            .offset(0),
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(1)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(12),
+    ];
+    let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&vertex_binding_descriptions)
+        .vertex_attribute_descriptions(&vertex_attribute_descriptions);
     let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
         .primitive_restart_enable(false);
@@ -480,7 +622,17 @@ fn create_device(
     let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true);
-    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut features13);
+    let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+        .buffer_device_address(true)
+        .descriptor_indexing(true)
+        .descriptor_binding_partially_bound(true)
+        .runtime_descriptor_array(true)
+        .descriptor_binding_variable_descriptor_count(true)
+        .descriptor_binding_storage_buffer_update_after_bind(true)
+        .descriptor_binding_sampled_image_update_after_bind(true);
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut features13)
+        .push_next(&mut features12);
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_info_list)
         .enabled_extension_names(&device_extensions_ptrs)
@@ -776,11 +928,89 @@ fn create_allocator(
         device: device.clone(),
         physical_device,
         debug_settings,
-        buffer_device_address: false,
+        buffer_device_address: true,
         allocation_sizes: gpu_allocator::AllocationSizes::default(),
     };
     let allocator = gpu_allocator::vulkan::Allocator::new(&allocator_create_info)?;
     Ok(allocator)
+}
+
+fn create_bindless_descriptor_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout, Box<dyn std::error::Error + 'static>> {
+    let binding_flags = [
+        vk::DescriptorBindingFlags::UPDATE_AFTER_BIND | vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+        vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+            | vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT,
+    ];
+
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1000)
+            .stage_flags(vk::ShaderStageFlags::ALL),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1000)
+            .stage_flags(vk::ShaderStageFlags::ALL),
+    ];
+
+    let mut binding_flags_info =
+        vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
+
+    let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+        .bindings(&bindings)
+        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+        .push_next(&mut binding_flags_info);
+
+    let layout = unsafe { device.create_descriptor_set_layout(&layout_info, None)? };
+    Ok(layout)
+}
+
+fn create_bindless_descriptor_pool(
+    device: &ash::Device,
+) -> Result<vk::DescriptorPool, Box<dyn std::error::Error + 'static>> {
+    let pool_sizes = [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1000,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1000,
+        },
+    ];
+
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .pool_sizes(&pool_sizes)
+        .max_sets(1)
+        .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND);
+
+    let pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+    Ok(pool)
+}
+
+fn allocate_bindless_descriptor_set(
+    device: &ash::Device,
+    pool: vk::DescriptorPool,
+    layout: vk::DescriptorSetLayout,
+) -> Result<vk::DescriptorSet, Box<dyn std::error::Error + 'static>> {
+    let descriptor_counts = [1000u32];
+    let mut variable_descriptor_count_info =
+        vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
+            .descriptor_counts(&descriptor_counts);
+
+    let layouts = [layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool)
+        .set_layouts(&layouts)
+        .push_next(&mut variable_descriptor_count_info);
+
+    let sets = unsafe { device.allocate_descriptor_sets(&allocate_info)? };
+    Ok(sets[0])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -960,7 +1190,8 @@ fn recreate_swapchain(
     )?;
     log::info!("Recreated swapchain");
 
-    let (pipeline_layout, pipeline) = create_pipeline(&renderer.device, &swapchain)?;
+    let (pipeline_layout, pipeline) =
+        create_pipeline(&renderer.device, &swapchain, renderer.bindless_set_layout)?;
     log::info!("Recreated render pipeline and layout");
 
     renderer.swapchain = swapchain;
@@ -1109,9 +1340,37 @@ fn render_frame(
             command_buffer,
             vk::PipelineBindPoint::GRAPHICS,
             renderer.pipeline,
-        )
+        );
+
+        renderer.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            renderer.pipeline_layout,
+            0,
+            &[renderer.bindless_descriptor_set],
+            &[],
+        );
+
+        if let Some(vertex_buffer) = renderer.buffers.first() {
+            renderer.device.cmd_bind_vertex_buffers(
+                command_buffer,
+                0,
+                &[vertex_buffer.buffer],
+                &[0],
+            );
+        }
+
+        let texture_index: u32 = 0;
+        renderer.device.cmd_push_constants(
+            command_buffer,
+            renderer.pipeline_layout,
+            vk::ShaderStageFlags::FRAGMENT,
+            0,
+            &texture_index.to_ne_bytes(),
+        );
+
+        renderer.device.cmd_draw(command_buffer, 6, 1, 0, 0);
     };
-    unsafe { renderer.device.cmd_draw(command_buffer, 3, 1, 0, 0) };
 
     if let Some(primitives) = clipped_primitives
         && let Some(egui_renderer) = &mut renderer.egui_renderer
@@ -1236,5 +1495,363 @@ fn cleanup_swapchain(renderer: &mut Renderer) {
             .swapchain
             .swapchain
             .destroy_swapchain(renderer.swapchain.swapchain_khr, None);
+    }
+}
+
+fn generate_checkerboard_texture(square_size: u32) -> Vec<u8> {
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 256;
+    const CHANNELS: u32 = 4;
+
+    let mut data = vec![0u8; (WIDTH * HEIGHT * CHANNELS) as usize];
+
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let checker_x = x / square_size;
+            let checker_y = y / square_size;
+            let is_white = (checker_x + checker_y).is_multiple_of(2);
+
+            let color = if is_white { 255u8 } else { 0u8 };
+            let index = ((y * WIDTH + x) * CHANNELS) as usize;
+            data[index] = color;
+            data[index + 1] = color;
+            data[index + 2] = color;
+            data[index + 3] = 255;
+        }
+    }
+
+    data
+}
+
+impl Renderer {
+    fn create_buffer(
+        &mut self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        memory_location: gpu_allocator::MemoryLocation,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(
+                usage
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::STORAGE_BUFFER,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe { self.device.create_buffer(&buffer_info, None)? };
+        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+
+        let allocation = self.allocator.as_ref().unwrap().lock().unwrap().allocate(
+            &gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "buffer",
+                requirements,
+                location: memory_location,
+                linear: true,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            },
+        )?;
+
+        unsafe {
+            self.device
+                .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?
+        };
+
+        let binding_array_index = self.buffers.len() as u32;
+
+        let buffer_info = vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(size);
+
+        let descriptor_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(binding_array_index)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&buffer_info));
+
+        unsafe { self.device.update_descriptor_sets(&[descriptor_write], &[]) };
+
+        self.buffers.push(Buffer {
+            buffer,
+            allocation: Some(allocation),
+            _binding_array_index: binding_array_index,
+        });
+
+        Ok(())
+    }
+
+    fn create_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .samples(vk::SampleCountFlags::TYPE_1);
+
+        let image = unsafe { self.device.create_image(&image_info, None)? };
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+
+        let allocation = self.allocator.as_ref().unwrap().lock().unwrap().allocate(
+            &gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "texture",
+                requirements,
+                location: gpu_allocator::MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            },
+        )?;
+
+        unsafe {
+            self.device
+                .bind_image_memory(image, allocation.memory(), allocation.offset())?
+        };
+
+        let staging_buffer_info = vk::BufferCreateInfo::default()
+            .size(data.len() as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let staging_buffer = unsafe { self.device.create_buffer(&staging_buffer_info, None)? };
+        let staging_requirements =
+            unsafe { self.device.get_buffer_memory_requirements(staging_buffer) };
+
+        let staging_allocation = self.allocator.as_ref().unwrap().lock().unwrap().allocate(
+            &gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "staging_buffer",
+                requirements: staging_requirements,
+                location: gpu_allocator::MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            },
+        )?;
+
+        unsafe {
+            self.device.bind_buffer_memory(
+                staging_buffer,
+                staging_allocation.memory(),
+                staging_allocation.offset(),
+            )?
+        };
+
+        unsafe {
+            let mapped_ptr = staging_allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped_ptr, data.len());
+        }
+
+        let command_buffer_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let command_buffer =
+            unsafe { self.device.allocate_command_buffers(&command_buffer_info)?[0] };
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            self.device
+                .begin_command_buffer(command_buffer, &begin_info)?
+        };
+
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        let dependency_info =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+
+        unsafe {
+            self.device
+                .cmd_pipeline_barrier2(command_buffer, &dependency_info)
+        };
+
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                command_buffer,
+                staging_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            )
+        };
+
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        let dependency_info =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+
+        unsafe {
+            self.device
+                .cmd_pipeline_barrier2(command_buffer, &dependency_info)
+        };
+
+        unsafe { self.device.end_command_buffer(command_buffer)? };
+
+        let command_buffer_infos =
+            [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
+        let submit_info = vk::SubmitInfo2::default().command_buffer_infos(&command_buffer_infos);
+
+        let fence = unsafe {
+            self.device
+                .create_fence(&vk::FenceCreateInfo::default(), None)?
+        };
+
+        unsafe {
+            self.device
+                .queue_submit2(self.graphics_queue, &[submit_info], fence)?;
+            self.device.wait_for_fences(&[fence], true, u64::MAX)?;
+            self.device.destroy_fence(fence, None);
+        };
+
+        unsafe {
+            self.device
+                .free_command_buffers(self.command_pool, &[command_buffer]);
+            self.device.destroy_buffer(staging_buffer, None);
+        }
+
+        self.allocator
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .free(staging_allocation)?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        let view = unsafe { self.device.create_image_view(&view_info, None)? };
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(false)
+            .max_anisotropy(1.0)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false)
+            .compare_enable(false)
+            .compare_op(vk::CompareOp::ALWAYS)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .mip_lod_bias(0.0)
+            .min_lod(0.0)
+            .max_lod(0.0);
+
+        let sampler = unsafe { self.device.create_sampler(&sampler_info, None)? };
+
+        let binding_array_index = self.textures.len() as u32;
+
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(view)
+            .sampler(sampler);
+
+        let descriptor_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_descriptor_set)
+            .dst_binding(1)
+            .dst_array_element(binding_array_index)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&image_info));
+
+        unsafe { self.device.update_descriptor_sets(&[descriptor_write], &[]) };
+
+        self.textures.push(Texture {
+            image,
+            view,
+            sampler,
+            allocation: Some(allocation),
+            _binding_array_index: binding_array_index,
+        });
+
+        Ok(())
+    }
+
+    fn upload_buffer_data<T>(
+        &mut self,
+        buffer_index: usize,
+        data: &[T],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(buffer) = self.buffers.get(buffer_index) {
+            if let Some(allocation) = &buffer.allocation {
+                unsafe {
+                    let mapped_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut T;
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), mapped_ptr, data.len());
+                }
+                Ok(())
+            } else {
+                Err("Buffer has no allocation".into())
+            }
+        } else {
+            Err("Buffer index out of bounds".into())
+        }
     }
 }
