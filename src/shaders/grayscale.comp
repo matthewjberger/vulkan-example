@@ -1,0 +1,20 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform image2D inputImage;
+layout(binding = 1) uniform image2D outputImage;
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(inputImage);
+
+    if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
+        return;
+    }
+
+    vec4 color = imageLoad(inputImage, pixelCoord);
+    float gray = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+    imageStore(outputImage, pixelCoord, vec4(gray, gray, gray, color.a));
+}

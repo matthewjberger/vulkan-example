@@ -1,0 +1,72 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform image2D inputImage;
+layout(binding = 1) uniform image2D outputImage;
+
+const float FXAA_SPAN_MAX = 8.0;
+const float FXAA_REDUCE_MUL = 1.0 / 8.0;
+const float FXAA_REDUCE_MIN = 1.0 / 128.0;
+
+vec3 fxaa(ivec2 pixelCoord, ivec2 imageSize) {
+    vec2 inverseScreenSize = 1.0 / vec2(imageSize);
+    vec2 texCoords = (vec2(pixelCoord) + 0.5) * inverseScreenSize;
+
+    vec3 rgbNW = imageLoad(inputImage, pixelCoord + ivec2(-1, -1)).rgb;
+    vec3 rgbNE = imageLoad(inputImage, pixelCoord + ivec2(1, -1)).rgb;
+    vec3 rgbSW = imageLoad(inputImage, pixelCoord + ivec2(-1, 1)).rgb;
+    vec3 rgbSE = imageLoad(inputImage, pixelCoord + ivec2(1, 1)).rgb;
+    vec3 rgbM  = imageLoad(inputImage, pixelCoord).rgb;
+
+    vec3 luma = vec3(0.299, 0.587, 0.114);
+    float lumaNW = dot(rgbNW, luma);
+    float lumaNE = dot(rgbNE, luma);
+    float lumaSW = dot(rgbSW, luma);
+    float lumaSE = dot(rgbSE, luma);
+    float lumaM  = dot(rgbM,  luma);
+
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+
+    vec2 dir;
+    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+    float dirReduce = max(
+        (lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * FXAA_REDUCE_MUL),
+        FXAA_REDUCE_MIN);
+
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = min(vec2(FXAA_SPAN_MAX, FXAA_SPAN_MAX),
+          max(vec2(-FXAA_SPAN_MAX, -FXAA_SPAN_MAX),
+          dir * rcpDirMin)) * inverseScreenSize;
+
+    vec3 rgbA = 0.5 * (
+        imageLoad(inputImage, ivec2((texCoords + dir * (1.0 / 3.0 - 0.5)) * vec2(imageSize))).rgb +
+        imageLoad(inputImage, ivec2((texCoords + dir * (2.0 / 3.0 - 0.5)) * vec2(imageSize))).rgb);
+    vec3 rgbB = rgbA * 0.5 + 0.25 * (
+        imageLoad(inputImage, ivec2((texCoords + dir * (0.0 / 3.0 - 0.5)) * vec2(imageSize))).rgb +
+        imageLoad(inputImage, ivec2((texCoords + dir * (3.0 / 3.0 - 0.5)) * vec2(imageSize))).rgb);
+
+    float lumaB = dot(rgbB, luma);
+    if ((lumaB < lumaMin) || (lumaB > lumaMax)) {
+        return rgbA;
+    } else {
+        return rgbB;
+    }
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(inputImage);
+
+    if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
+        return;
+    }
+
+    vec3 color = fxaa(pixelCoord, imageSize);
+    float alpha = imageLoad(inputImage, pixelCoord).a;
+    imageStore(outputImage, pixelCoord, vec4(color, alpha));
+}

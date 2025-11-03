@@ -2,7 +2,7 @@
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
 
-layout(set = 0, binding = 1) uniform sampler2D textures[];
+layout(set = 1, binding = 1) uniform sampler2D textures[];
 
 layout(push_constant) uniform PushConstants {
     uint texture_index;

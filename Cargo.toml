@@ -20,3 +20,5 @@ gpu-allocator = { version = "0.28.0", features = [
 log = "0.4.28"
 raw-window-handle = "0.6.2"
 winit = "0.30.12"
+thiserror = "2.0.17"
+nalgebra-glm = "0.18"
