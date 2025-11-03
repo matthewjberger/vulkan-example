@@ -1,6 +1,12 @@
 use ash::{ext::debug_utils, khr::swapchain, vk};
 use std::sync::{Arc, Mutex};
 
+const RING_STAGING_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_BINDLESS_BUFFERS: u32 = 1000;
+const MAX_BINDLESS_TEXTURES: u32 = 1000;
+const FRAMES_IN_FLIGHT: usize = 3;
+const MAX_CACHED_COMMAND_BUFFERS: usize = 32;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
@@ -177,10 +183,836 @@ impl winit::application::ApplicationHandler for Context {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResourceState {
+    layout: vk::ImageLayout,
+    queue_family: u32,
+    access_stage: vk::PipelineStageFlags2,
+    access_flags: vk::AccessFlags2,
+}
+
+#[derive(Debug)]
+enum ResourceType {
+    Image { image: vk::Image, mip_levels: u32 },
+    Buffer { buffer: vk::Buffer, size: u64 },
+}
+
+#[derive(Debug)]
+struct TrackedResource {
+    resource_type: ResourceType,
+    current_state: ResourceState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum QueueType {
+    Graphics,
+    Transfer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessType {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceAccess {
+    resource_name: String,
+    desired_layout: Option<vk::ImageLayout>,
+    stage_flags: vk::PipelineStageFlags2,
+    access_flags: vk::AccessFlags2,
+    access_type: AccessType,
+}
+
+#[derive(Debug, Clone)]
+struct FrameGraphPass {
+    queue_type: QueueType,
+    resource_accesses: Vec<ResourceAccess>,
+}
+
+#[derive(Debug)]
+struct GeneratedBarrier {
+    image_barriers: Vec<vk::ImageMemoryBarrier2<'static>>,
+    buffer_barriers: Vec<vk::BufferMemoryBarrier2<'static>>,
+}
+
+struct FrameGraph {
+    resources: std::collections::HashMap<String, TrackedResource>,
+    graphics_queue_family: u32,
+    transfer_queue_family: Option<u32>,
+}
+
+impl FrameGraph {
+    fn new(graphics_queue_family: u32, transfer_queue_family: Option<u32>) -> Self {
+        Self {
+            resources: std::collections::HashMap::new(),
+            graphics_queue_family,
+            transfer_queue_family,
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        self.resources
+            .retain(|name, _| !name.starts_with("swapchain") && !name.ends_with("_transient"));
+    }
+
+    fn register_image(
+        &mut self,
+        name: &str,
+        image: vk::Image,
+        mip_levels: u32,
+        initial_layout: vk::ImageLayout,
+        initial_queue: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.resources.contains_key(name) {
+            self.resources.remove(name);
+        }
+
+        self.resources.insert(
+            name.to_string(),
+            TrackedResource {
+                resource_type: ResourceType::Image { image, mip_levels },
+                current_state: ResourceState {
+                    layout: initial_layout,
+                    queue_family: initial_queue,
+                    access_stage: vk::PipelineStageFlags2::NONE,
+                    access_flags: vk::AccessFlags2::NONE,
+                },
+            },
+        );
+
+        log::debug!("Registered image resource: {}", name);
+        Ok(())
+    }
+
+    fn register_buffer(
+        &mut self,
+        name: &str,
+        buffer: vk::Buffer,
+        size: u64,
+        initial_queue: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.resources.contains_key(name) {
+            return Err(format!("Resource '{}' already registered", name).into());
+        }
+
+        self.resources.insert(
+            name.to_string(),
+            TrackedResource {
+                resource_type: ResourceType::Buffer { buffer, size },
+                current_state: ResourceState {
+                    layout: vk::ImageLayout::UNDEFINED,
+                    queue_family: initial_queue,
+                    access_stage: vk::PipelineStageFlags2::NONE,
+                    access_flags: vk::AccessFlags2::NONE,
+                },
+            },
+        );
+
+        log::debug!("Registered buffer resource: {}", name);
+        Ok(())
+    }
+
+    fn generate_barriers_for_pass(
+        &self,
+        pass: &FrameGraphPass,
+    ) -> Result<GeneratedBarrier, Box<dyn std::error::Error>> {
+        let mut image_barriers = Vec::new();
+        let mut buffer_barriers = Vec::new();
+
+        let dst_queue_family = match pass.queue_type {
+            QueueType::Graphics => self.graphics_queue_family,
+            QueueType::Transfer => self
+                .transfer_queue_family
+                .expect("Transfer queue not available"),
+        };
+
+        for access in &pass.resource_accesses {
+            let resource = self
+                .resources
+                .get(&access.resource_name)
+                .ok_or(format!("Resource not found: {}", access.resource_name))?;
+
+            let current_state = &resource.current_state;
+
+            let layout_changed = access.desired_layout.is_some()
+                && access.desired_layout.unwrap() != current_state.layout;
+            let queue_changed = current_state.queue_family != dst_queue_family;
+            let has_write_hazard = access.access_type == AccessType::Write
+                || current_state
+                    .access_flags
+                    .contains(vk::AccessFlags2::MEMORY_WRITE);
+
+            let needs_barrier = layout_changed || queue_changed || has_write_hazard;
+
+            if needs_barrier {
+                match &resource.resource_type {
+                    ResourceType::Image {
+                        image, mip_levels, ..
+                    } => {
+                        let old_layout = current_state.layout;
+                        let new_layout = access.desired_layout.unwrap_or(current_state.layout);
+
+                        let (src_queue_family_index, dst_queue_family_index) =
+                            if current_state.queue_family == dst_queue_family {
+                                (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+                            } else {
+                                (current_state.queue_family, dst_queue_family)
+                            };
+
+                        let barrier = vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(
+                                if current_state.access_stage == vk::PipelineStageFlags2::NONE {
+                                    vk::PipelineStageFlags2::TOP_OF_PIPE
+                                } else {
+                                    current_state.access_stage
+                                },
+                            )
+                            .src_access_mask(current_state.access_flags)
+                            .old_layout(old_layout)
+                            .dst_stage_mask(access.stage_flags)
+                            .dst_access_mask(access.access_flags)
+                            .new_layout(new_layout)
+                            .src_queue_family_index(src_queue_family_index)
+                            .dst_queue_family_index(dst_queue_family_index)
+                            .image(*image)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: 0,
+                                level_count: *mip_levels,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            });
+
+                        log::debug!(
+                            "  Generated barrier for '{}': layout {:?}->{:?}, queue {}->{}",
+                            access.resource_name,
+                            old_layout,
+                            new_layout,
+                            current_state.queue_family,
+                            dst_queue_family
+                        );
+
+                        image_barriers.push(barrier);
+                    }
+                    ResourceType::Buffer { buffer, size } => {
+                        let (src_queue_family_index, dst_queue_family_index) =
+                            if current_state.queue_family == dst_queue_family {
+                                (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+                            } else {
+                                (current_state.queue_family, dst_queue_family)
+                            };
+
+                        let barrier = vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(
+                                if current_state.access_stage == vk::PipelineStageFlags2::NONE {
+                                    vk::PipelineStageFlags2::TOP_OF_PIPE
+                                } else {
+                                    current_state.access_stage
+                                },
+                            )
+                            .src_access_mask(current_state.access_flags)
+                            .dst_stage_mask(access.stage_flags)
+                            .dst_access_mask(access.access_flags)
+                            .src_queue_family_index(src_queue_family_index)
+                            .dst_queue_family_index(dst_queue_family_index)
+                            .buffer(*buffer)
+                            .offset(0)
+                            .size(*size);
+
+                        log::debug!(
+                            "  Generated barrier for buffer '{}': queue {}->{}",
+                            access.resource_name,
+                            current_state.queue_family,
+                            dst_queue_family
+                        );
+
+                        buffer_barriers.push(barrier);
+                    }
+                }
+            }
+        }
+
+        Ok(GeneratedBarrier {
+            image_barriers,
+            buffer_barriers,
+        })
+    }
+
+    fn update_resource_states(&mut self, pass: &FrameGraphPass) {
+        let queue_family = match pass.queue_type {
+            QueueType::Graphics => self.graphics_queue_family,
+            QueueType::Transfer => self
+                .transfer_queue_family
+                .expect("Transfer queue not available"),
+        };
+
+        for access in &pass.resource_accesses {
+            if let Some(resource) = self.resources.get_mut(&access.resource_name) {
+                if let Some(layout) = access.desired_layout {
+                    resource.current_state.layout = layout;
+                }
+                resource.current_state.queue_family = queue_family;
+                resource.current_state.access_stage = access.stage_flags;
+                resource.current_state.access_flags = access.access_flags;
+            }
+        }
+    }
+
+    fn add_pass(&mut self, queue_type: QueueType) -> PassBuilder<'_> {
+        PassBuilder {
+            graph: self,
+            pass: FrameGraphPass {
+                queue_type,
+                resource_accesses: Vec::new(),
+            },
+        }
+    }
+}
+
+struct PassBuilder<'a> {
+    graph: &'a mut FrameGraph,
+    pass: FrameGraphPass,
+}
+
+impl<'a> PassBuilder<'a> {
+    fn read_image(
+        mut self,
+        resource_name: &str,
+        layout: vk::ImageLayout,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> Self {
+        self.pass.resource_accesses.push(ResourceAccess {
+            resource_name: resource_name.to_string(),
+            desired_layout: Some(layout),
+            stage_flags: stage,
+            access_flags: access,
+            access_type: AccessType::Read,
+        });
+        self
+    }
+
+    fn write_image(
+        mut self,
+        resource_name: &str,
+        layout: vk::ImageLayout,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> Self {
+        self.pass.resource_accesses.push(ResourceAccess {
+            resource_name: resource_name.to_string(),
+            desired_layout: Some(layout),
+            stage_flags: stage,
+            access_flags: access,
+            access_type: AccessType::Write,
+        });
+        self
+    }
+
+    fn read_buffer(
+        mut self,
+        resource_name: &str,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> Self {
+        self.pass.resource_accesses.push(ResourceAccess {
+            resource_name: resource_name.to_string(),
+            desired_layout: None,
+            stage_flags: stage,
+            access_flags: access,
+            access_type: AccessType::Read,
+        });
+        self
+    }
+
+    fn write_buffer(
+        mut self,
+        resource_name: &str,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> Self {
+        self.pass.resource_accesses.push(ResourceAccess {
+            resource_name: resource_name.to_string(),
+            desired_layout: None,
+            stage_flags: stage,
+            access_flags: access,
+            access_type: AccessType::Write,
+        });
+        self
+    }
+
+    fn execute_inline<F>(
+        self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        func: F,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnOnce(&ash::Device, vk::CommandBuffer) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        for access in &self.pass.resource_accesses {
+            if !self.graph.resources.contains_key(&access.resource_name) {
+                return Err(format!("Unknown resource: {}", access.resource_name).into());
+            }
+        }
+
+        let barriers = self.graph.generate_barriers_for_pass(&self.pass)?;
+
+        if !barriers.image_barriers.is_empty() || !barriers.buffer_barriers.is_empty() {
+            let dependency_info = vk::DependencyInfo::default()
+                .image_memory_barriers(&barriers.image_barriers)
+                .buffer_memory_barriers(&barriers.buffer_barriers);
+            unsafe { device.cmd_pipeline_barrier2(cmd, &dependency_info) };
+        }
+
+        func(device, cmd)?;
+
+        self.graph.update_resource_states(&self.pass);
+
+        Ok(())
+    }
+
+    fn execute<F>(
+        self,
+        device: &ash::Device,
+        graphics_pool: vk::CommandPool,
+        graphics_queue: vk::Queue,
+        func: F,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnOnce(&ash::Device, vk::CommandBuffer) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        for access in &self.pass.resource_accesses {
+            if !self.graph.resources.contains_key(&access.resource_name) {
+                return Err(format!("Unknown resource: {}", access.resource_name).into());
+            }
+        }
+
+        let (pool, queue) = match self.pass.queue_type {
+            QueueType::Graphics => (graphics_pool, graphics_queue),
+            QueueType::Transfer => panic!("Transfer queue not supported in execute method"),
+        };
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let cmd = unsafe { device.allocate_command_buffers(&alloc_info)?[0] };
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { device.begin_command_buffer(cmd, &begin_info)? };
+
+        let barriers = self.graph.generate_barriers_for_pass(&self.pass)?;
+
+        if !barriers.image_barriers.is_empty() || !barriers.buffer_barriers.is_empty() {
+            let dependency_info = vk::DependencyInfo::default()
+                .image_memory_barriers(&barriers.image_barriers)
+                .buffer_memory_barriers(&barriers.buffer_barriers);
+            unsafe { device.cmd_pipeline_barrier2(cmd, &dependency_info) };
+        }
+
+        func(device, cmd)?;
+
+        unsafe { device.end_command_buffer(cmd)? };
+
+        let cmd_buffer_info = vk::CommandBufferSubmitInfo::default().command_buffer(cmd);
+        let submit_info =
+            vk::SubmitInfo2::default().command_buffer_infos(std::slice::from_ref(&cmd_buffer_info));
+
+        unsafe {
+            device.queue_submit2(queue, std::slice::from_ref(&submit_info), vk::Fence::null())?;
+            device.queue_wait_idle(queue)?;
+        };
+
+        self.graph.update_resource_states(&self.pass);
+
+        unsafe { device.free_command_buffers(pool, &[cmd]) };
+
+        Ok(())
+    }
+}
+
+struct CommandBufferPool {
+    device: ash::Device,
+    pool: vk::CommandPool,
+    buffers: Vec<vk::CommandBuffer>,
+    next_index: usize,
+}
+
+impl CommandBufferPool {
+    fn new(
+        device: ash::Device,
+        pool: vk::CommandPool,
+        initial_count: u32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(initial_count);
+
+        let buffers = unsafe { device.allocate_command_buffers(&allocate_info)? };
+
+        Ok(Self {
+            device: device.clone(),
+            pool,
+            buffers,
+            next_index: 0,
+        })
+    }
+
+    fn acquire(&mut self) -> Result<vk::CommandBuffer, Box<dyn std::error::Error>> {
+        if self.next_index >= self.buffers.len() {
+            let allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let new_buffer = unsafe { self.device.allocate_command_buffers(&allocate_info)?[0] };
+            self.buffers.push(new_buffer);
+        }
+
+        let buffer = self.buffers[self.next_index];
+        self.next_index += 1;
+        Ok(buffer)
+    }
+
+    fn reset(&mut self) {
+        if self.buffers.len() > MAX_CACHED_COMMAND_BUFFERS {
+            let excess = &self.buffers[MAX_CACHED_COMMAND_BUFFERS..];
+            unsafe {
+                self.device.free_command_buffers(self.pool, excess);
+            }
+            self.buffers.truncate(MAX_CACHED_COMMAND_BUFFERS);
+        }
+        self.next_index = 0;
+    }
+}
+
+struct StagingBuffer {
+    buffer: vk::Buffer,
+    allocation: Option<gpu_allocator::vulkan::Allocation>,
+    size: u64,
+    frames_since_shrink_check: u32,
+    max_used_size: u64,
+}
+
+impl StagingBuffer {
+    fn ensure_capacity(
+        &mut self,
+        device: &ash::Device,
+        allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+        required_size: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.max_used_size = self.max_used_size.max(required_size);
+
+        if required_size > self.size {
+            if self.buffer != vk::Buffer::null() {
+                unsafe { device.destroy_buffer(self.buffer, None) };
+            }
+            if let Some(allocation) = self.allocation.take() {
+                allocator.lock().unwrap().free(allocation)?;
+            }
+
+            let new_size = (required_size * 3) / 2;
+
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(new_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            self.buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+            let requirements = unsafe { device.get_buffer_memory_requirements(self.buffer) };
+
+            self.allocation = Some(allocator.lock().unwrap().allocate(
+                &gpu_allocator::vulkan::AllocationCreateDesc {
+                    name: "staging_buffer",
+                    requirements,
+                    location: gpu_allocator::MemoryLocation::CpuToGpu,
+                    linear: true,
+                    allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+                },
+            )?);
+
+            unsafe {
+                device.bind_buffer_memory(
+                    self.buffer,
+                    self.allocation.as_ref().unwrap().memory(),
+                    self.allocation.as_ref().unwrap().offset(),
+                )?;
+            }
+
+            self.size = new_size;
+            self.max_used_size = required_size;
+            self.frames_since_shrink_check = 0;
+        }
+        Ok(())
+    }
+
+    fn check_and_shrink(
+        &mut self,
+        device: &ash::Device,
+        allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const SHRINK_CHECK_INTERVAL: u32 = 300;
+        const SHRINK_THRESHOLD: f32 = 0.25;
+
+        self.frames_since_shrink_check += 1;
+
+        if self.frames_since_shrink_check >= SHRINK_CHECK_INTERVAL && self.size > 0 {
+            let usage_ratio = self.max_used_size as f32 / self.size as f32;
+
+            if usage_ratio < SHRINK_THRESHOLD {
+                let new_size = (self.max_used_size * 3) / 2;
+
+                if self.buffer != vk::Buffer::null() {
+                    unsafe { device.destroy_buffer(self.buffer, None) };
+                }
+                if let Some(allocation) = self.allocation.take() {
+                    allocator.lock().unwrap().free(allocation)?;
+                }
+
+                let buffer_info = vk::BufferCreateInfo::default()
+                    .size(new_size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+                self.buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+                let requirements = unsafe { device.get_buffer_memory_requirements(self.buffer) };
+
+                self.allocation = Some(allocator.lock().unwrap().allocate(
+                    &gpu_allocator::vulkan::AllocationCreateDesc {
+                        name: "staging_buffer",
+                        requirements,
+                        location: gpu_allocator::MemoryLocation::CpuToGpu,
+                        linear: true,
+                        allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+                    },
+                )?);
+
+                unsafe {
+                    device.bind_buffer_memory(
+                        self.buffer,
+                        self.allocation.as_ref().unwrap().memory(),
+                        self.allocation.as_ref().unwrap().offset(),
+                    )?;
+                }
+
+                log::info!(
+                    "Shrunk staging buffer from {} to {} bytes (usage: {:.1}%)",
+                    self.size,
+                    new_size,
+                    usage_ratio * 100.0
+                );
+
+                self.size = new_size;
+            }
+
+            self.max_used_size = 0;
+            self.frames_since_shrink_check = 0;
+        }
+
+        Ok(())
+    }
+
+    fn get_mapped_ptr(&self) -> *mut u8 {
+        self.allocation
+            .as_ref()
+            .unwrap()
+            .mapped_ptr()
+            .unwrap()
+            .as_ptr() as *mut u8
+    }
+}
+
+struct RingStagingBuffer {
+    buffer: vk::Buffer,
+    allocation: Option<gpu_allocator::vulkan::Allocation>,
+    total_size: u64,
+    head: u64,
+    tail: u64,
+    in_flight: std::collections::VecDeque<(u64, u64, u64)>,
+}
+
+impl RingStagingBuffer {
+    fn new(
+        device: &ash::Device,
+        allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+        size: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+        let allocation = Some(allocator.lock().unwrap().allocate(
+            &gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "ring_staging",
+                requirements,
+                location: gpu_allocator::MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            },
+        )?);
+
+        unsafe {
+            device.bind_buffer_memory(
+                buffer,
+                allocation.as_ref().unwrap().memory(),
+                allocation.as_ref().unwrap().offset(),
+            )?;
+        }
+
+        Ok(Self {
+            buffer,
+            allocation,
+            total_size: size,
+            head: 0,
+            tail: 0,
+            in_flight: std::collections::VecDeque::new(),
+        })
+    }
+
+    fn free_completed(&mut self, current_timeline_value: u64) {
+        while let Some((offset, size, completion_value)) = self.in_flight.front() {
+            if current_timeline_value >= *completion_value {
+                self.tail = (offset + size) % self.total_size;
+                self.in_flight.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn allocate(
+        &mut self,
+        size: u64,
+        completion_value: u64,
+    ) -> Result<(u64, *mut u8), Box<dyn std::error::Error>> {
+        let aligned_size = (size + 255) & !255;
+
+        let space_to_end = self.total_size - self.head;
+
+        let offset = if space_to_end < aligned_size {
+            if space_to_end > 0 {
+                self.in_flight
+                    .push_back((self.head, space_to_end, completion_value));
+            }
+            self.head = 0;
+
+            if self.tail > 0 && aligned_size > self.tail {
+                return Err("Ring buffer full - not enough space after wrap".into());
+            } else if self.tail == 0 {
+                return Err("Ring buffer full - GPU not consuming fast enough".into());
+            }
+
+            0
+        } else {
+            if self.head >= self.tail {
+                self.head
+            } else {
+                if self.head + aligned_size > self.tail {
+                    return Err("Ring buffer full - would collide with tail".into());
+                }
+                self.head
+            }
+        };
+
+        let ptr = unsafe {
+            self.allocation
+                .as_ref()
+                .unwrap()
+                .mapped_ptr()
+                .unwrap()
+                .as_ptr()
+                .add(offset as usize) as *mut u8
+        };
+
+        self.in_flight
+            .push_back((offset, aligned_size, completion_value));
+        self.head = (offset + aligned_size) % self.total_size;
+
+        Ok((offset, ptr))
+    }
+
+    fn get_usage_stats(&self) -> (u64, u64, usize) {
+        let used = if self.head >= self.tail {
+            self.head - self.tail
+        } else {
+            self.total_size - (self.tail - self.head)
+        };
+        let available = self.total_size - used;
+        let pending_ops = self.in_flight.len();
+
+        (used, available, pending_ops)
+    }
+
+    fn allocate_blocking(
+        &mut self,
+        size: u64,
+        completion_value: u64,
+        device: &ash::Device,
+        semaphore: vk::Semaphore,
+    ) -> Result<(u64, *mut u8), Box<dyn std::error::Error>> {
+        const TIMEOUT_NS: u64 = 5_000_000_000;
+
+        loop {
+            match self.allocate(size, completion_value) {
+                Ok(result) => return Ok(result),
+                Err(_) => {
+                    if let Some((_, _, oldest_value)) = self.in_flight.front() {
+                        let wait_values = [*oldest_value];
+                        let wait_semaphores = [semaphore];
+                        let wait_info = vk::SemaphoreWaitInfo::default()
+                            .semaphores(&wait_semaphores)
+                            .values(&wait_values);
+                        let wait_result = unsafe {
+                            device.wait_semaphores(&wait_info, TIMEOUT_NS)
+                        };
+                        match wait_result {
+                            Ok(()) => {
+                                let current = unsafe { device.get_semaphore_counter_value(semaphore)? };
+                                self.free_completed(current);
+                            }
+                            Err(vk::Result::TIMEOUT) => {
+                                return Err(format!(
+                                    "Timeout waiting for ring buffer space (waited {}s)",
+                                    TIMEOUT_NS as f64 / 1_000_000_000.0
+                                ).into());
+                            }
+                            Err(error) => {
+                                return Err(format!("Failed to wait for semaphore: {}", error).into());
+                            }
+                        }
+                    } else {
+                        return Err("Ring buffer exhausted with no in-flight operations".into());
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+}
+
 struct Buffer {
     buffer: vk::Buffer,
     allocation: Option<gpu_allocator::vulkan::Allocation>,
     _binding_array_index: u32,
+    size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextureState {
+    Uploading { completion_value: u64 },
+    Ready,
 }
 
 struct Texture {
@@ -189,6 +1021,10 @@ struct Texture {
     sampler: vk::Sampler,
     allocation: Option<gpu_allocator::vulkan::Allocation>,
     _binding_array_index: u32,
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+    state: TextureState,
 }
 
 struct Renderer {
@@ -221,6 +1057,7 @@ struct Renderer {
     pub swapchain: Swapchain,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
+    pub pipeline_cache: vk::PipelineCache,
     pub command_buffers: Vec<vk::CommandBuffer>,
 
     pub image_available_semaphores: Vec<vk::Semaphore>,
@@ -232,13 +1069,21 @@ struct Renderer {
 
     pub is_swapchain_dirty: bool,
 
+    pub frame_graph: FrameGraph,
+    pub command_buffer_pool: CommandBufferPool,
+    pub transfer_command_buffer_pool: Option<CommandBufferPool>,
+    pub staging_buffer: Option<StagingBuffer>,
+    pub ring_staging: Option<RingStagingBuffer>,
+
     pub egui_renderer: Option<egui_ash_renderer::Renderer>,
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.device.device_wait_idle();
+            if let Err(e) = self.device.device_wait_idle() {
+                log::error!("Failed to wait for device idle during cleanup: {:?}", e);
+            }
             self.egui_renderer = None;
 
             for i in 0..self.frames_in_flight {
@@ -259,26 +1104,68 @@ impl Drop for Renderer {
                 self.device.destroy_image_view(texture.view, None);
                 self.device.destroy_image(texture.image, None);
                 if let Some(allocation) = texture.allocation.take() {
-                    let _ = self
+                    if let Err(e) = self
                         .allocator
                         .as_ref()
                         .unwrap()
                         .lock()
                         .unwrap()
-                        .free(allocation);
+                        .free(allocation)
+                    {
+                        log::error!("Failed to free texture allocation: {:?}", e);
+                    }
                 }
             }
 
             for buffer in &mut self.buffers {
                 self.device.destroy_buffer(buffer.buffer, None);
                 if let Some(allocation) = buffer.allocation.take() {
-                    let _ = self
+                    if let Err(e) = self
                         .allocator
                         .as_ref()
                         .unwrap()
                         .lock()
                         .unwrap()
-                        .free(allocation);
+                        .free(allocation)
+                    {
+                        log::error!("Failed to free buffer allocation: {:?}", e);
+                    }
+                }
+            }
+
+            if let Some(staging) = &mut self.staging_buffer {
+                if staging.buffer != vk::Buffer::null() {
+                    self.device.destroy_buffer(staging.buffer, None);
+                }
+                if let Some(allocation) = staging.allocation.take() {
+                    if let Err(e) = self
+                        .allocator
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .free(allocation)
+                    {
+                        log::error!("Failed to free staging buffer allocation: {:?}", e);
+                    }
+                }
+            }
+
+            if let Some(ring) = &mut self.ring_staging {
+                if ring.buffer != vk::Buffer::null() {
+                    self.device.destroy_buffer(ring.buffer, None);
+                }
+                if let Some(allocation) = ring.allocation.take() {
+                    if let Err(e) = self
+                        .allocator
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .free(allocation)
+                    {
+                        log::error!("Failed to free ring staging allocation: {:?}", e);
+                    }
                 }
             }
 
@@ -286,6 +1173,12 @@ impl Drop for Renderer {
                 .destroy_descriptor_pool(self.bindless_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.bindless_set_layout, None);
+
+            if let Err(error) = save_pipeline_cache(&self.device, self.pipeline_cache) {
+                log::warn!("Failed to save pipeline cache: {}", error);
+            }
+            self.device
+                .destroy_pipeline_cache(self.pipeline_cache, None);
 
             self.allocator = None;
 
@@ -386,6 +1279,26 @@ where
     )?;
     log::info!("Created swapchain");
 
+    let format_properties = unsafe {
+        instance.get_physical_device_format_properties(
+            physical_device,
+            vk::Format::R8G8B8A8_UNORM,
+        )
+    };
+    if !format_properties
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+    {
+        return Err("R8G8B8A8_UNORM does not support linear filtering for mipmaps".into());
+    }
+    if !format_properties
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
+    {
+        return Err("R8G8B8A8_UNORM does not support blit operations for mipmaps".into());
+    }
+    log::info!("Validated format features for mipmap generation");
+
     let bindless_set_layout = create_bindless_descriptor_layout(&device)?;
     log::info!("Created bindless descriptor layout");
 
@@ -396,10 +1309,10 @@ where
         allocate_bindless_descriptor_set(&device, bindless_pool, bindless_set_layout)?;
     log::info!("Allocated bindless descriptor set");
 
-    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, bindless_set_layout)?;
-    log::info!("Created render pipeline and layout");
+    let pipeline_cache = create_pipeline_cache(&device)?;
 
-    const FRAMES_IN_FLIGHT: usize = 3;
+    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, bindless_set_layout, pipeline_cache)?;
+    log::info!("Created render pipeline and layout");
 
     let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
         allocator.clone(),
@@ -445,6 +1358,26 @@ where
         unsafe { device.create_semaphore(&timeline_semaphore_info, None)? };
     log::info!("Created timeline semaphore for async transfers");
 
+    let command_buffer_pool = CommandBufferPool::new(device.clone(), command_pool, 8)?;
+
+    let transfer_command_buffer_pool = transfer_command_pool
+        .map(|pool| CommandBufferPool::new(device.clone(), pool, 8))
+        .transpose()?;
+
+    let command_buffers = {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(swapchain.images.len() as _);
+        unsafe { device.allocate_command_buffers(&allocate_info)? }
+    };
+
+    let ring_staging = Some(RingStagingBuffer::new(
+        &device,
+        &allocator,
+        RING_STAGING_SIZE,
+    )?);
+
     let mut renderer = Renderer {
         _entry: entry,
         instance,
@@ -475,7 +1408,8 @@ where
         swapchain,
         pipeline,
         pipeline_layout,
-        command_buffers: vec![],
+        pipeline_cache,
+        command_buffers,
         image_available_semaphores,
         render_finished_semaphores,
         in_flight_fences,
@@ -483,13 +1417,26 @@ where
         current_frame: 0,
         frames_in_flight: FRAMES_IN_FLIGHT,
         is_swapchain_dirty: false,
+        frame_graph: FrameGraph::new(graphics_queue_family_index, transfer_queue_family_index),
+        command_buffer_pool,
+        transfer_command_buffer_pool,
+        staging_buffer: Some(StagingBuffer {
+            buffer: vk::Buffer::null(),
+            allocation: None,
+            size: 0,
+            frames_since_shrink_check: 0,
+            max_used_size: 0,
+        }),
+        ring_staging,
         egui_renderer: Some(egui_renderer),
     };
-    renderer.command_buffers = create_and_record_command_buffers(&renderer)?;
-    log::info!("Created and recorded command buffers");
+
+    log::info!("Allocated command buffers");
 
     let test_textures = generate_test_textures();
-    renderer.batch_upload_textures(test_textures)?;
+    for (name, width, height, data) in test_textures {
+        renderer.upload_texture_async(name, width, height, data)?;
+    }
 
     #[repr(C)]
     struct Vertex {
@@ -536,13 +1483,108 @@ where
 
     log::info!("Created test vertex buffer");
 
+    log::debug!("Registering resources in frame graph");
+    for (index, texture) in renderer.textures.iter().enumerate() {
+        renderer.frame_graph.register_image(
+            &format!("texture_{}", index),
+            texture.image,
+            texture.mip_levels,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            renderer.graphics_queue_family_index,
+        )?;
+    }
+
+    if let Some(vertex_buffer) = renderer.buffers.first() {
+        renderer.frame_graph.register_buffer(
+            "vertex_buffer",
+            vertex_buffer.buffer,
+            vertex_buffer.size,
+            renderer.graphics_queue_family_index,
+        )?;
+    }
+
+    log::info!("Creating test buffer for write->read hazard test");
+    let test_buffer_size = 1024u64;
+    renderer.create_buffer(
+        test_buffer_size,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        gpu_allocator::MemoryLocation::GpuOnly,
+    )?;
+
+    let test_buffer_index = renderer.buffers.len() - 1;
+    renderer.frame_graph.register_buffer(
+        "test_buffer",
+        renderer.buffers[test_buffer_index].buffer,
+        test_buffer_size,
+        renderer.graphics_queue_family_index,
+    )?;
+
+    if renderer._transfer_queue.is_some() {
+        log::debug!("Testing frame graph graphics queue support");
+
+        renderer
+            .frame_graph
+            .add_pass(QueueType::Graphics)
+            .read_image(
+                "texture_0",
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+            )
+            .execute(
+                &renderer.device,
+                renderer.command_pool,
+                renderer.graphics_queue,
+                |_device, _cmd| {
+                    log::debug!("  Executing on graphics queue!");
+                    Ok(())
+                },
+            )?;
+    }
+
     Ok(renderer)
+}
+
+fn create_pipeline_cache(
+    device: &ash::Device,
+) -> Result<vk::PipelineCache, Box<dyn std::error::Error + 'static>> {
+    let cache_path = std::path::Path::new("pipeline_cache.bin");
+    let initial_data = if cache_path.exists() {
+        match std::fs::read(cache_path) {
+            Ok(data) => {
+                log::info!("Loaded pipeline cache from disk ({} bytes)", data.len());
+                data
+            }
+            Err(error) => {
+                log::warn!("Failed to read pipeline cache: {}", error);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let cache_info = vk::PipelineCacheCreateInfo::default().initial_data(&initial_data);
+    let cache = unsafe { device.create_pipeline_cache(&cache_info, None)? };
+    log::info!("Created pipeline cache");
+    Ok(cache)
+}
+
+fn save_pipeline_cache(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+) -> Result<(), Box<dyn std::error::Error + 'static>> {
+    let cache_data = unsafe { device.get_pipeline_cache_data(cache)? };
+    std::fs::write("pipeline_cache.bin", &cache_data)?;
+    log::info!("Saved pipeline cache to disk ({} bytes)", cache_data.len());
+    Ok(())
 }
 
 fn create_pipeline(
     device: &ash::Device,
     swapchain: &Swapchain,
     bindless_set_layout: vk::DescriptorSetLayout,
+    pipeline_cache: vk::PipelineCache,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error + 'static>> {
     let descriptor_set_layouts = [bindless_set_layout];
     let push_constant_range = vk::PushConstantRange::default()
@@ -655,7 +1697,7 @@ fn create_pipeline(
     let pipeline = unsafe {
         device
             .create_graphics_pipelines(
-                vk::PipelineCache::null(),
+                pipeline_cache,
                 std::slice::from_ref(&pipeline_info),
                 None,
             )
@@ -1208,26 +2250,6 @@ fn read_shader(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     Ok(ash::util::read_spv(&mut cursor)?)
 }
 
-fn create_and_record_command_buffers(
-    renderer: &Renderer,
-) -> Result<Vec<vk::CommandBuffer>, Box<dyn std::error::Error>> {
-    let device = &renderer.device;
-    let pool = renderer.command_pool;
-    let count = renderer.swapchain.images.len();
-
-    log::info!("Creating and recording command buffers");
-    let buffers = {
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(count as _);
-
-        unsafe { device.allocate_command_buffers(&allocate_info)? }
-    };
-
-    Ok(buffers)
-}
-
 fn recreate_swapchain(
     renderer: &mut Renderer,
     width: u32,
@@ -1259,16 +2281,33 @@ fn recreate_swapchain(
     log::info!("Recreated swapchain");
 
     let (pipeline_layout, pipeline) =
-        create_pipeline(&renderer.device, &swapchain, renderer.bindless_set_layout)?;
+        create_pipeline(&renderer.device, &swapchain, renderer.bindless_set_layout, renderer.pipeline_cache)?;
     log::info!("Recreated render pipeline and layout");
 
     renderer.swapchain = swapchain;
     renderer.pipeline = pipeline;
     renderer.pipeline_layout = pipeline_layout;
 
-    let command_buffers = create_and_record_command_buffers(renderer)?;
-    renderer.command_buffers = command_buffers;
-    log::info!("Recreated and recorded command buffers");
+    let needed_count = renderer.swapchain.images.len();
+    let current_count = renderer.command_buffers.len();
+
+    if needed_count > current_count {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(renderer.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count((needed_count - current_count) as _);
+        let mut new_buffers = unsafe { renderer.device.allocate_command_buffers(&allocate_info)? };
+        renderer.command_buffers.append(&mut new_buffers);
+        log::info!("Allocated {} additional command buffers", needed_count - current_count);
+    } else if needed_count < current_count {
+        let buffers_to_free: Vec<_> = renderer.command_buffers.drain(needed_count..).collect();
+        unsafe {
+            renderer.device.free_command_buffers(renderer.command_pool, &buffers_to_free);
+        }
+        log::info!("Freed {} excess command buffers", current_count - needed_count);
+    } else {
+        log::info!("Reused existing command buffers");
+    }
 
     renderer.images_in_flight = vec![vk::Fence::null(); renderer.swapchain.images.len()];
 
@@ -1318,6 +2357,12 @@ fn render_frame(
     renderer.images_in_flight[image_index as usize] = current_fence;
     unsafe { renderer.device.reset_fences(&[current_fence])? };
 
+    renderer.frame_graph.begin_frame();
+    renderer.command_buffer_pool.reset();
+    if let Some(transfer_pool) = &mut renderer.transfer_command_buffer_pool {
+        transfer_pool.reset();
+    }
+
     let (textures_delta, clipped_primitives, pixels_per_point) =
         if let Some((full_output, primitives)) = ui_frame_output {
             if !full_output.textures_delta.set.is_empty()
@@ -1347,6 +2392,14 @@ fn render_frame(
             .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())?;
     }
 
+    renderer.frame_graph.register_image(
+        "swapchain",
+        renderer.swapchain.images[image_index as usize],
+        1,
+        vk::ImageLayout::UNDEFINED,
+        renderer.graphics_queue_family_index,
+    )?;
+
     let command_buffer_begin_info = vk::CommandBufferBeginInfo::default();
     unsafe {
         renderer
@@ -1354,128 +2407,151 @@ fn render_frame(
             .begin_command_buffer(command_buffer, &command_buffer_begin_info)?
     };
 
-    let image_memory_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags2::empty())
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .new_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-        .image(renderer.swapchain.images[image_index as usize])
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            layer_count: 1,
-            level_count: 1,
-            ..Default::default()
-        });
+    renderer.process_pending_mipmaps(command_buffer)?;
 
-    let dependency_info = vk::DependencyInfo::default()
-        .image_memory_barriers(std::slice::from_ref(&image_memory_barrier));
+    let device = &renderer.device;
+    let swapchain_extent = renderer.swapchain.extent;
+    let swapchain_image_view = renderer.swapchain.image_views[image_index as usize];
+    let pipeline = renderer.pipeline;
+    let pipeline_layout = renderer.pipeline_layout;
+    let bindless_descriptor_set = renderer.bindless_descriptor_set;
+    let vertex_buffer = renderer.buffers.first().map(|b| b.buffer);
+    let texture_index = renderer.current_texture_index;
+    let egui_primitives = clipped_primitives;
+    let egui_ppp = pixels_per_point;
+    let egui_renderer_ptr = renderer.egui_renderer.as_mut().map(|r| r as *mut _);
 
-    unsafe {
-        renderer
-            .device
-            .cmd_pipeline_barrier2(command_buffer, &dependency_info)
-    };
+    renderer
+        .frame_graph
+        .add_pass(QueueType::Graphics)
+        .write_image(
+            "swapchain",
+            vk::ImageLayout::ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        )
+        .read_image(
+            &format!("texture_{}", texture_index),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        )
+        .read_buffer(
+            "vertex_buffer",
+            vk::PipelineStageFlags2::VERTEX_INPUT,
+            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
+        )
+        .execute_inline(device, command_buffer, |device, cmd| {
+            let color_attachment_info = vk::RenderingAttachmentInfo::default()
+                .image_view(swapchain_image_view)
+                .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.1, 0.1, 0.1, 1.0],
+                    },
+                });
 
-    let color_attachment_info = vk::RenderingAttachmentInfo::default()
-        .image_view(renderer.swapchain.image_views[image_index as usize])
-        .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .clear_value(vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.1, 0.1, 0.1, 1.0],
-            },
-        });
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: swapchain_extent,
+                })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&color_attachment_info));
 
-    let rendering_info = vk::RenderingInfo::default()
-        .render_area(vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: renderer.swapchain.extent,
-        })
-        .layer_count(1)
-        .color_attachments(std::slice::from_ref(&color_attachment_info));
+            unsafe {
+                device.cmd_begin_rendering(cmd, &rendering_info);
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline_layout,
+                    0,
+                    &[bindless_descriptor_set],
+                    &[],
+                );
 
-    unsafe {
-        renderer
-            .device
-            .cmd_begin_rendering(command_buffer, &rendering_info)
-    };
+                if let Some(vb) = vertex_buffer {
+                    device.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
+                }
 
-    unsafe {
-        renderer.device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            renderer.pipeline,
-        );
+                let tex_idx = texture_index as u32;
+                device.cmd_push_constants(
+                    cmd,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    &tex_idx.to_ne_bytes(),
+                );
 
-        renderer.device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            renderer.pipeline_layout,
-            0,
-            &[renderer.bindless_descriptor_set],
-            &[],
-        );
+                device.cmd_draw(cmd, 6, 1, 0, 0);
 
-        if let Some(vertex_buffer) = renderer.buffers.first() {
-            renderer.device.cmd_bind_vertex_buffers(
-                command_buffer,
-                0,
-                &[vertex_buffer.buffer],
-                &[0],
-            );
-        }
+                if let Some(primitives) = egui_primitives
+                    && let Some(egui_ptr) = egui_renderer_ptr
+                {
+                    let egui_renderer: &mut egui_ash_renderer::Renderer = &mut *egui_ptr;
+                    egui_renderer
+                        .cmd_draw(cmd, swapchain_extent, egui_ppp, &primitives)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                }
 
-        let texture_index: u32 = renderer.current_texture_index as u32;
-        renderer.device.cmd_push_constants(
-            command_buffer,
-            renderer.pipeline_layout,
-            vk::ShaderStageFlags::FRAGMENT,
-            0,
-            &texture_index.to_ne_bytes(),
-        );
+                device.cmd_end_rendering(cmd);
+            }
 
-        renderer.device.cmd_draw(command_buffer, 6, 1, 0, 0);
-    };
+            Ok(())
+        })?;
 
-    if let Some(primitives) = clipped_primitives
-        && let Some(egui_renderer) = &mut renderer.egui_renderer
-    {
-        egui_renderer.cmd_draw(
-            command_buffer,
-            renderer.swapchain.extent,
-            pixels_per_point,
-            &primitives,
-        )?;
-    }
+    renderer
+        .frame_graph
+        .add_pass(QueueType::Graphics)
+        .write_buffer(
+            "test_buffer",
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_WRITE,
+        )
+        .execute_inline(device, command_buffer, |_device, _cmd| {
+            log::debug!("  Writing to test buffer (compute)");
+            Ok(())
+        })?;
 
-    unsafe { renderer.device.cmd_end_rendering(command_buffer) };
+    renderer
+        .frame_graph
+        .add_pass(QueueType::Graphics)
+        .read_buffer(
+            "test_buffer",
+            vk::PipelineStageFlags2::VERTEX_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        )
+        .execute_inline(device, command_buffer, |_device, _cmd| {
+            log::debug!("  Reading from test buffer (vertex)");
+            Ok(())
+        })?;
 
-    let image_memory_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .old_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags2::empty())
-        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-        .image(renderer.swapchain.images[image_index as usize])
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            layer_count: 1,
-            level_count: 1,
-            ..Default::default()
-        });
+    renderer
+        .frame_graph
+        .add_pass(QueueType::Graphics)
+        .read_buffer(
+            "vertex_buffer",
+            vk::PipelineStageFlags2::VERTEX_INPUT,
+            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
+        )
+        .execute_inline(device, command_buffer, |_device, _cmd| {
+            log::debug!("  Reusing vertex buffer (should have no barrier)");
+            Ok(())
+        })?;
 
-    let dependency_info = vk::DependencyInfo::default()
-        .image_memory_barriers(std::slice::from_ref(&image_memory_barrier));
-
-    unsafe {
-        renderer
-            .device
-            .cmd_pipeline_barrier2(command_buffer, &dependency_info)
-    };
+    renderer
+        .frame_graph
+        .add_pass(QueueType::Graphics)
+        .read_image(
+            "swapchain",
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+            vk::AccessFlags2::NONE,
+        )
+        .execute_inline(device, command_buffer, |_device, _cmd| Ok(()))?;
 
     unsafe { renderer.device.end_command_buffer(command_buffer)? };
 
@@ -1528,6 +2604,12 @@ fn render_frame(
         _ => {}
     }
     renderer.current_frame = (renderer.current_frame + 1) % renderer.frames_in_flight;
+
+    if let Some(staging_buffer) = &mut renderer.staging_buffer {
+        if let Some(allocator) = &renderer.allocator {
+            let _ = staging_buffer.check_and_shrink(&renderer.device, allocator);
+        }
+    }
 
     if let Some(textures_delta) = textures_delta
         && !textures_delta.free.is_empty()
@@ -1728,6 +2810,7 @@ impl Renderer {
             buffer,
             allocation: Some(allocation),
             _binding_array_index: binding_array_index,
+            size,
         });
 
         Ok(())
@@ -1751,6 +2834,479 @@ impl Renderer {
         } else {
             Err("Buffer index out of bounds".into())
         }
+    }
+
+    fn upload_texture_async(
+        &mut self,
+        name: String,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        if self._transfer_queue.is_none() || self.transfer_command_buffer_pool.is_none() {
+            let textures = vec![(name.clone(), width, height, data)];
+            self.batch_upload_textures(textures)?;
+            return Ok(self.textures.len() - 1);
+        }
+
+        let mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(mip_levels)
+            .array_layers(1)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(
+                vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::SAMPLED,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .samples(vk::SampleCountFlags::TYPE_1);
+
+        let image = unsafe { self.device.create_image(&image_info, None)? };
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+
+        let allocation = self.allocator.as_ref().unwrap().lock().unwrap().allocate(
+            &gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "texture_async",
+                requirements,
+                location: gpu_allocator::MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            },
+        )?;
+
+        unsafe {
+            self.device
+                .bind_image_memory(image, allocation.memory(), allocation.offset())?
+        };
+
+        self.transfer_timeline_counter += 1;
+        let signal_value = self.transfer_timeline_counter;
+
+        let current_value = unsafe {
+            self.device
+                .get_semaphore_counter_value(self.transfer_timeline_semaphore)?
+        };
+        self.ring_staging
+            .as_mut()
+            .unwrap()
+            .free_completed(current_value);
+
+        let data_size = (width * height * 4) as u64;
+        let (staging_offset, staging_ptr) = self
+            .ring_staging
+            .as_mut()
+            .unwrap()
+            .allocate(data_size, signal_value)?;
+
+        if log::log_enabled!(log::Level::Debug) {
+            let (used, avail, pending) = self.ring_staging.as_ref().unwrap().get_usage_stats();
+            log::debug!(
+                "Ring staging: used={} MB, available={} MB, pending ops={}",
+                used / (1024 * 1024),
+                avail / (1024 * 1024),
+                pending
+            );
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), staging_ptr, data.len());
+        }
+
+        let staging_buffer = self.ring_staging.as_ref().unwrap().get_buffer();
+
+        let cmd = self
+            .transfer_command_buffer_pool
+            .as_mut()
+            .unwrap()
+            .acquire()?;
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { self.device.begin_command_buffer(cmd, &begin_info)? };
+
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+
+        let dep =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+        unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep) };
+
+        let copy = vk::BufferImageCopy::default()
+            .buffer_offset(staging_offset)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                staging_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+        }
+
+        let release = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(self._transfer_queue_family_index.unwrap())
+            .dst_queue_family_index(self.graphics_queue_family_index)
+            .image(image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+
+        let dep =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&release));
+        unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep) };
+        unsafe { self.device.end_command_buffer(cmd)? };
+
+        let cmd_buffer_info = vk::CommandBufferSubmitInfo::default().command_buffer(cmd);
+        let signal_semaphore_info = vk::SemaphoreSubmitInfo::default()
+            .semaphore(self.transfer_timeline_semaphore)
+            .value(signal_value)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
+
+        let submit_info = vk::SubmitInfo2::default()
+            .command_buffer_infos(std::slice::from_ref(&cmd_buffer_info))
+            .signal_semaphore_infos(std::slice::from_ref(&signal_semaphore_info));
+
+        unsafe {
+            self.device
+                .queue_submit2(self._transfer_queue.unwrap(), std::slice::from_ref(&submit_info), vk::Fence::null())?;
+        }
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(mip_levels)
+                    .layer_count(1),
+            );
+        let view = unsafe { self.device.create_image_view(&view_info, None)? };
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .max_lod(mip_levels as f32);
+        let sampler = unsafe { self.device.create_sampler(&sampler_info, None)? };
+
+        let binding_idx = self.textures.len() as u32;
+        let desc_info = vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(view)
+            .sampler(sampler);
+
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_descriptor_set)
+            .dst_binding(1)
+            .dst_array_element(binding_idx)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&desc_info));
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+
+        let texture_idx = self.textures.len();
+        self.textures.push(Texture {
+            image,
+            view,
+            sampler,
+            allocation: Some(allocation),
+            _binding_array_index: binding_idx,
+            width,
+            height,
+            mip_levels,
+            state: TextureState::Uploading {
+                completion_value: signal_value,
+            },
+        });
+        self.texture_names.push(name.clone());
+
+        self.frame_graph.register_image(
+            &format!("texture_{}", texture_idx),
+            image,
+            mip_levels,
+            vk::ImageLayout::UNDEFINED,
+            self._transfer_queue_family_index.unwrap(),
+        )?;
+
+        Ok(texture_idx)
+    }
+
+    fn process_pending_mipmaps(
+        &mut self,
+        cmd: vk::CommandBuffer,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let current_value = unsafe {
+            self.device
+                .get_semaphore_counter_value(self.transfer_timeline_semaphore)?
+        };
+
+        let mut completed_indices = Vec::new();
+        for (idx, texture) in self.textures.iter().enumerate() {
+            if let TextureState::Uploading { completion_value } = texture.state {
+                if current_value >= completion_value {
+                    completed_indices.push(idx);
+                }
+            }
+        }
+
+        if completed_indices.is_empty() {
+            return Ok(());
+        }
+
+        for idx in completed_indices {
+            let texture = &self.textures[idx];
+            let image = texture.image;
+            let mip_levels = texture.mip_levels;
+            let width = texture.width;
+            let height = texture.height;
+
+            let acquire_mip0 = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::BLIT)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(self._transfer_queue_family_index.unwrap())
+                .dst_queue_family_index(self.graphics_queue_family_index)
+                .image(image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+
+            let barriers = if mip_levels > 1 {
+                let init_remaining_mips = vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::BLIT)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(1)
+                            .level_count(mip_levels - 1)
+                            .layer_count(1),
+                    );
+                vec![acquire_mip0, init_remaining_mips]
+            } else {
+                vec![acquire_mip0]
+            };
+
+            let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+            unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep) };
+
+            let base_mip_transition = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::BLIT)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::BLIT)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+
+            let dep = vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&base_mip_transition));
+            unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep) };
+
+            let mut mip_w = width;
+            let mut mip_h = height;
+
+            for mip in 1..mip_levels {
+                let next_w = if mip_w > 1 { mip_w / 2 } else { 1 };
+                let next_h = if mip_h > 1 { mip_h / 2 } else { 1 };
+
+                let blit = vk::ImageBlit::default()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(mip - 1)
+                            .layer_count(1),
+                    )
+                    .src_offsets([
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: mip_w as i32,
+                            y: mip_h as i32,
+                            z: 1,
+                        },
+                    ])
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(mip)
+                            .layer_count(1),
+                    )
+                    .dst_offsets([
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: next_w as i32,
+                            y: next_h as i32,
+                            z: 1,
+                        },
+                    ]);
+
+                unsafe {
+                    self.device.cmd_blit_image(
+                        cmd,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[blit],
+                        vk::Filter::LINEAR,
+                    );
+                }
+
+                let barrier = vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::BLIT)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(mip - 1)
+                            .level_count(1)
+                            .layer_count(1),
+                    );
+
+                let dep = vk::DependencyInfo::default()
+                    .image_memory_barriers(std::slice::from_ref(&barrier));
+                unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep) };
+
+                if mip < mip_levels - 1 {
+                    let barrier = vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::BLIT)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::BLIT)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .base_mip_level(mip)
+                                .level_count(1)
+                                .layer_count(1),
+                        );
+
+                    let dep = vk::DependencyInfo::default()
+                        .image_memory_barriers(std::slice::from_ref(&barrier));
+                    unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep) };
+                }
+
+                mip_w = next_w;
+                mip_h = next_h;
+            }
+
+            let final_barrier = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::BLIT)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(mip_levels - 1)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+
+            let dep = vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&final_barrier));
+            unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep) };
+
+            self.textures[idx].state = TextureState::Ready;
+
+            self.frame_graph.register_image(
+                &format!("texture_{}", idx),
+                image,
+                mip_levels,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                self.graphics_queue_family_index,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn batch_upload_textures(
@@ -1782,35 +3338,11 @@ impl Renderer {
             total_size = aligned_offset + base_size;
         }
 
-        let staging_buffer_info = vk::BufferCreateInfo::default()
-            .size(total_size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let staging_buffer = unsafe { self.device.create_buffer(&staging_buffer_info, None)? };
-        let staging_requirements =
-            unsafe { self.device.get_buffer_memory_requirements(staging_buffer) };
-
-        let staging_allocation = self.allocator.as_ref().unwrap().lock().unwrap().allocate(
-            &gpu_allocator::vulkan::AllocationCreateDesc {
-                name: "staging_buffer",
-                requirements: staging_requirements,
-                location: gpu_allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-            },
-        )?;
+        let staging = self.staging_buffer.as_mut().unwrap();
+        staging.ensure_capacity(&self.device, &self.allocator.as_ref().unwrap(), total_size)?;
 
         unsafe {
-            self.device.bind_buffer_memory(
-                staging_buffer,
-                staging_allocation.memory(),
-                staging_allocation.offset(),
-            )?
-        };
-
-        unsafe {
-            let mapped_ptr = staging_allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+            let mapped_ptr = staging.get_mapped_ptr();
             for (_, _, _, _, offset, data) in &texture_info {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr(),
@@ -1820,9 +3352,16 @@ impl Renderer {
             }
         }
 
+        let staging_buffer = staging.buffer;
+
+        let has_mipmaps = texture_info
+            .iter()
+            .any(|(_, _, _, mip_levels, _, _)| *mip_levels > 1);
+
         let use_transfer_queue = self.transfer_command_pool.is_some()
             && self._transfer_queue.is_some()
-            && self._transfer_queue_family_index != Some(self.graphics_queue_family_index);
+            && self._transfer_queue_family_index != Some(self.graphics_queue_family_index)
+            && !has_mipmaps;
 
         let command_pool = if use_transfer_queue {
             self.transfer_command_pool.unwrap()
@@ -2058,13 +3597,13 @@ impl Renderer {
                 mip_height = next_mip_height;
             }
 
-            if *mip_levels > 1 {
-                let previous_mips_barrier = vk::ImageMemoryBarrier2::default()
+            let last_mip_barrier = if use_transfer_queue {
+                vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .dst_access_mask(vk::AccessFlags2::NONE)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .src_queue_family_index(queue_family_index)
                     .dst_queue_family_index(self.graphics_queue_family_index)
@@ -2073,38 +3612,30 @@ impl Renderer {
                         vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
                             .base_mip_level(0)
-                            .level_count(*mip_levels - 1)
+                            .level_count(*mip_levels)
                             .base_array_layer(0)
                             .layer_count(1),
-                    );
-
-                let dependency_info = vk::DependencyInfo::default()
-                    .image_memory_barriers(std::slice::from_ref(&previous_mips_barrier));
-
-                unsafe {
-                    self.device
-                        .cmd_pipeline_barrier2(command_buffer, &dependency_info)
-                };
-            }
-
-            let last_mip_barrier = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(queue_family_index)
-                .dst_queue_family_index(self.graphics_queue_family_index)
-                .image(image)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(*mip_levels - 1)
-                        .level_count(1)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                );
+                    )
+            } else {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(*mip_levels - 1)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+            };
 
             let dependency_info = vk::DependencyInfo::default()
                 .image_memory_barriers(std::slice::from_ref(&last_mip_barrier));
@@ -2169,6 +3700,10 @@ impl Renderer {
                 sampler,
                 allocation: Some(allocation),
                 _binding_array_index: binding_array_index,
+                width: *width,
+                height: *height,
+                mip_levels: *mip_levels,
+                state: TextureState::Ready,
             });
 
             self.texture_names.push(name.clone());
@@ -2178,15 +3713,16 @@ impl Renderer {
 
         self.transfer_timeline_counter += 1;
         let signal_value = self.transfer_timeline_counter;
-        let signal_values = [signal_value];
 
-        let mut timeline_semaphore_submit_info =
-            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&signal_values);
+        let cmd_buffer_info = vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer);
+        let signal_semaphore_info = vk::SemaphoreSubmitInfo::default()
+            .semaphore(self.transfer_timeline_semaphore)
+            .value(signal_value)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
 
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(std::slice::from_ref(&command_buffer))
-            .signal_semaphores(std::slice::from_ref(&self.transfer_timeline_semaphore))
-            .push_next(&mut timeline_semaphore_submit_info);
+        let submit_info = vk::SubmitInfo2::default()
+            .command_buffer_infos(std::slice::from_ref(&cmd_buffer_info))
+            .signal_semaphore_infos(std::slice::from_ref(&signal_semaphore_info));
 
         let queue = if use_transfer_queue {
             self._transfer_queue.unwrap()
@@ -2196,7 +3732,7 @@ impl Renderer {
 
         unsafe {
             self.device
-                .queue_submit(queue, &[submit_info], vk::Fence::null())?
+                .queue_submit2(queue, std::slice::from_ref(&submit_info), vk::Fence::null())?
         };
 
         log::info!(
@@ -2282,16 +3818,6 @@ impl Renderer {
                     .free_command_buffers(self.command_pool, &[graphics_cmd_buffer]);
             }
         }
-
-        unsafe {
-            self.device.destroy_buffer(staging_buffer, None);
-        }
-        self.allocator
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .free(staging_allocation)?;
 
         Ok(())
     }
