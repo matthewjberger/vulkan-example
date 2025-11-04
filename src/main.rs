@@ -915,7 +915,7 @@ fn create_and_record_command_buffers(
 ) -> Result<Vec<vk::CommandBuffer>, Box<dyn std::error::Error>> {
     let device = &renderer.device;
     let pool = renderer.command_pool;
-    let count = renderer.swapchain.images.len();
+    let count = renderer.frames_in_flight;
 
     log::info!("Creating and recording command buffers");
     let buffers = {
@@ -1040,7 +1040,7 @@ fn render_frame(
             (None, None, 1.0)
         };
 
-    let command_buffer = renderer.command_buffers[image_index as usize];
+    let command_buffer = renderer.command_buffers[renderer.current_frame];
 
     unsafe {
         renderer
