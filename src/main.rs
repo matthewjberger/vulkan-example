@@ -511,8 +511,6 @@ struct Texture {
     allocation: Option<gpu_allocator::vulkan::Allocation>,
     _binding_array_index: u32,
     mip_levels: u32,
-    width: u32,
-    height: u32,
 }
 
 struct Renderer {
@@ -527,11 +525,9 @@ struct Renderer {
     pub present_queue_family_index: u32,
     pub graphics_queue_family_index: u32,
     pub _transfer_queue_family_index: Option<u32>,
-    pub compute_queue_family_index: Option<u32>,
     pub graphics_queue: vk::Queue,
     pub present_queue: vk::Queue,
     pub _transfer_queue: Option<vk::Queue>,
-    pub compute_queue: Option<vk::Queue>,
     pub command_pool: vk::CommandPool,
     pub allocator: Option<Arc<Mutex<gpu_allocator::vulkan::Allocator>>>,
     pub bindless_descriptor_set: vk::DescriptorSet,
@@ -594,7 +590,6 @@ struct Renderer {
     pub mvp_descriptor_set_layout: Option<vk::DescriptorSetLayout>,
     pub mvp_descriptor_pool: Option<vk::DescriptorPool>,
     pub mvp_descriptor_set: Option<vk::DescriptorSet>,
-    pub last_graph_structure: Option<String>,
 }
 
 impl Drop for Renderer {
@@ -765,8 +760,8 @@ impl Drop for Renderer {
 
             let _ = self.device.device_wait_idle();
 
-            if let Some(pool) = self.transient_pool.take() {
-                pool.destroy();
+            if let Some(mut pool) = self.transient_pool.take() {
+                pool.cleanup();
             }
 
             if let Some(allocator) = self.allocator.take() {
@@ -861,8 +856,6 @@ where
     let present_queue = unsafe { device.get_device_queue(present_queue_family_index, 0) };
     let transfer_queue =
         transfer_queue_family_index.map(|index| unsafe { device.get_device_queue(index, 0) });
-    let compute_queue =
-        compute_queue_family_index.map(|index| unsafe { device.get_device_queue(index, 0) });
     log::info!("Got device queues");
 
     let command_pool = create_command_pool(graphics_queue_family_index, &device)?;
@@ -1023,11 +1016,9 @@ where
         present_queue_family_index,
         graphics_queue_family_index,
         _transfer_queue_family_index: transfer_queue_family_index,
-        compute_queue_family_index,
         graphics_queue,
         present_queue,
         _transfer_queue: transfer_queue,
-        compute_queue,
         command_pool,
         allocator: Some(allocator.clone()),
         bindless_descriptor_set,
@@ -1096,7 +1087,6 @@ where
         mvp_descriptor_set_layout: None,
         mvp_descriptor_pool: None,
         mvp_descriptor_set: None,
-        last_graph_structure: None,
     };
 
     log::info!("Allocated command buffers");
@@ -2206,31 +2196,17 @@ fn build_frame_render_graph(
         renderer.upload_buffer_data(mvp_buffer_index, &[mvp_array])?;
     }
 
-    let mut graph = render_graph::RenderGraph::new(
-        renderer.graphics_queue_family_index,
-        renderer
-            ._transfer_queue_family_index
-            .unwrap_or(renderer.graphics_queue_family_index),
-        renderer
-            .compute_queue_family_index
-            .unwrap_or(renderer.graphics_queue_family_index),
-    );
+    let mut graph = render_graph::RenderGraph::new();
 
     graph.import_image(
         "swapchain",
         render_graph::ImportedImageDesc {
             image: renderer.swapchain.images[image_index as usize],
             view: renderer.swapchain.image_views[image_index as usize],
-            extent: vk::Extent3D {
-                width: renderer.swapchain.extent.width,
-                height: renderer.swapchain.extent.height,
-                depth: 1,
-            },
             format: renderer.swapchain.format.format,
             mip_levels: 1,
             array_layers: 1,
             initial_layout: vk::ImageLayout::UNDEFINED,
-            initial_queue_family: vk::QUEUE_FAMILY_IGNORED,
         },
     );
 
@@ -2242,16 +2218,10 @@ fn build_frame_render_graph(
             render_graph::ImportedImageDesc {
                 image: texture.image,
                 view: texture.view,
-                extent: vk::Extent3D {
-                    width: texture.width,
-                    height: texture.height,
-                    depth: 1,
-                },
                 format: vk::Format::R8G8B8A8_UNORM,
                 mip_levels: texture.mip_levels,
                 array_layers: 1,
                 initial_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                initial_queue_family: renderer.graphics_queue_family_index,
             },
         );
     }
@@ -2277,7 +2247,6 @@ fn build_frame_render_graph(
             usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             mip_levels: 1,
             array_layers: 1,
-            auto_generate_mipmaps: false,
         },
     );
 
@@ -2318,7 +2287,6 @@ fn build_frame_render_graph(
 
     graph
         .add_pass(render_graph::PassDesc {
-            queue_type: render_graph::QueueType::Graphics,
             accesses: offscreen_accesses,
             execute: Some(Box::new(move |ctx| {
                 let _offscreen = ctx.get_image(offscreen_target_id)?;
@@ -2327,7 +2295,6 @@ fn build_frame_render_graph(
                 }
                 Ok(())
             })),
-            enabled: true,
         })
         .ok();
 
@@ -2344,7 +2311,6 @@ fn build_frame_render_graph(
                 usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
                 mip_levels: 1,
                 array_layers: 1,
-                auto_generate_mipmaps: false,
             },
         ))
     } else {
@@ -2388,7 +2354,6 @@ fn build_frame_render_graph(
     };
 
     graph.add_pass(render_graph::PassDesc {
-        queue_type: render_graph::QueueType::Graphics,
         accesses,
         execute: Some(Box::new(move |ctx| {
             let (_render_target_image, render_target_view) = ctx.get_image(render_target_id)?;
@@ -2458,7 +2423,6 @@ fn build_frame_render_graph(
 
             Ok(())
         })),
-        enabled: true,
     })?;
 
     let swapchain_id = graph.get_resource("swapchain").unwrap();
@@ -2471,8 +2435,7 @@ fn build_frame_render_graph(
         let grayscale_descriptor_set = renderer.grayscale_descriptor_sets[renderer.current_frame];
         let grayscale_target_id = render_target_id;
 
-        let grayscale_pass_id = graph.add_pass(render_graph::PassDesc {
-            queue_type: render_graph::QueueType::Compute,
+        graph.add_pass(render_graph::PassDesc {
             accesses: vec![render_graph::ResourceAccess {
                 resource_id: grayscale_target_id,
                 access_type: render_graph::AccessType::Write,
@@ -2528,12 +2491,7 @@ fn build_frame_render_graph(
 
                 Ok(())
             })),
-            enabled: true,
         })?;
-
-        if !renderer.grayscale_enabled {
-            graph.disable_pass(grayscale_pass_id);
-        }
     }
 
     if renderer.fxaa_enabled
@@ -2544,8 +2502,7 @@ fn build_frame_render_graph(
     {
         let fxaa_descriptor_set = renderer.fxaa_descriptor_sets[renderer.current_frame];
 
-        let fxaa_pass_id = graph.add_pass(render_graph::PassDesc {
-            queue_type: render_graph::QueueType::Compute,
+        graph.add_pass(render_graph::PassDesc {
             accesses: vec![
                 render_graph::ResourceAccess {
                     resource_id: scene_out_id,
@@ -2609,16 +2566,10 @@ fn build_frame_render_graph(
 
                 Ok(())
             })),
-            enabled: true,
         })?;
-
-        if !renderer.fxaa_enabled {
-            graph.disable_pass(fxaa_pass_id);
-        }
 
         if egui_primitives.is_some() && egui_renderer_ptr.is_some() {
             graph.add_pass(render_graph::PassDesc {
-                queue_type: render_graph::QueueType::Graphics,
                 accesses: vec![render_graph::ResourceAccess {
                     resource_id: swapchain_id,
                     access_type: render_graph::AccessType::Write,
@@ -2663,13 +2614,11 @@ fn build_frame_render_graph(
 
                     Ok(())
                 })),
-                enabled: true,
             })?;
         }
     }
 
     graph.add_pass(render_graph::PassDesc {
-        queue_type: render_graph::QueueType::Graphics,
         accesses: vec![render_graph::ResourceAccess {
             resource_id: swapchain_id,
             access_type: render_graph::AccessType::Read,
@@ -2678,14 +2627,7 @@ fn build_frame_render_graph(
             stage_mask: vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
         }],
         execute: None,
-        enabled: true,
     })?;
-
-    let graphviz = graph.export_graphviz();
-    if renderer.last_graph_structure.as_ref() != Some(&graphviz) {
-        log::debug!("Render graph structure:\n{}", graphviz);
-        renderer.last_graph_structure = Some(graphviz);
-    }
 
     Ok(graph)
 }
@@ -2776,23 +2718,7 @@ fn render_frame(
     let graph =
         build_frame_render_graph(renderer, image_index, clipped_primitives, pixels_per_point)?;
 
-    let graphics_timeline_base = renderer.graphics_timeline_counter;
-    let transfer_timeline_base = renderer.transfer_timeline_counter;
-    let compute_timeline_base = renderer.compute_timeline_counter;
-
-    let compiled_graph = graph.compile(render_graph::CompileOptions {
-        graphics_timeline_base,
-        transfer_timeline_base,
-        compute_timeline_base,
-        has_transfer_queue: true,
-        has_compute_queue: true,
-        print_aliasing_report: false,
-    })?;
-
-    let (max_graphics, max_transfer, max_compute) = compiled_graph.get_max_timeline_values();
-    renderer.graphics_timeline_counter = max_graphics;
-    renderer.transfer_timeline_counter = max_transfer;
-    renderer.compute_timeline_counter = max_compute;
+    let compiled_graph = graph.compile()?;
 
     let command_buffer = renderer.command_buffers[image_index as usize];
     unsafe {
@@ -2805,25 +2731,15 @@ fn render_frame(
         renderer.image_available_semaphores[renderer.current_frame],
         vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
     )];
-    let signal_semaphores_for_graph = [(
-        renderer.render_finished_semaphores[image_index as usize],
-        vk::PipelineStageFlags2::ALL_COMMANDS,
-    )];
+    let signal_semaphores = [renderer.render_finished_semaphores[image_index as usize]];
 
     compiled_graph.execute(render_graph::ExecutionContext {
         device: &renderer.device,
-        graphics_cmd_pool: &mut renderer.command_buffer_pool,
+        graphics_cmd_pool: renderer.command_buffer_pool.pool,
         graphics_queue: renderer.graphics_queue,
-        transfer_cmd_pool: renderer.transfer_command_buffer_pool.as_mut(),
-        transfer_queue: renderer._transfer_queue,
-        compute_cmd_pool: renderer.compute_command_buffer_pool.as_mut(),
-        compute_queue: renderer.compute_queue,
         fence: current_fence,
         wait_semaphores: &wait_semaphores,
-        signal_semaphores: &signal_semaphores_for_graph,
-        graphics_timeline_semaphore: renderer.graphics_timeline_semaphore,
-        transfer_timeline_semaphore: Some(renderer.transfer_timeline_semaphore),
-        compute_timeline_semaphore: Some(renderer.compute_timeline_semaphore),
+        signal_semaphores: &signal_semaphores,
         transient_pool: renderer.transient_pool.as_mut().unwrap(),
     })?;
 
@@ -3469,8 +3385,6 @@ impl Renderer {
             allocation: Some(allocation),
             _binding_array_index: binding_idx,
             mip_levels,
-            width,
-            height,
         });
         self.texture_names.push(name.clone());
 
@@ -3870,8 +3784,6 @@ impl Renderer {
                 allocation: Some(allocation),
                 _binding_array_index: binding_array_index,
                 mip_levels: *mip_levels,
-                width: *width,
-                height: *height,
             });
 
             self.texture_names.push(name.clone());
