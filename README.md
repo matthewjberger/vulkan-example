@@ -4,6 +4,8 @@ This is an example of using rust, winit, vulkan, and egui together without using
 
 This uses Vulkan 1.3 with dynamic rendering, including the features needed for gpu-driven rendering
 
+<img width="837" height="632" alt="vulkan" src="https://github.com/user-attachments/assets/001493e8-fa77-4eab-b621-baf455c1890b" />
+
 ## Quickstart
 
 Run using the precompiled shaders with:
@@ -19,6 +21,3 @@ Then install [just](https://github.com/casey/just) to run the commands in the ju
 ```rust
 just run
 ```
-
-
-![image](https://github.com/user-attachments/assets/4beef2f5-5895-4402-9977-51e04f006d0a)
