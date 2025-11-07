@@ -1,4 +1,5 @@
 use ash::{ext::debug_utils, khr::swapchain, vk};
+use nalgebra_glm as glm;
 use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,6 +15,11 @@ struct Context {
     pub window_handle: Option<winit::window::Window>,
     pub renderer: Option<Renderer>,
     pub egui_state: Option<egui_winit::State>,
+}
+
+struct UniformBuffer {
+    pub buffer: vk::Buffer,
+    pub allocation: Option<gpu_allocator::vulkan::Allocation>,
 }
 
 impl winit::application::ApplicationHandler for Context {
@@ -163,6 +169,11 @@ struct Renderer {
     pub pipeline_layout: vk::PipelineLayout,
     pub command_buffers: Vec<vk::CommandBuffer>,
 
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_pool: vk::DescriptorPool,
+    pub descriptor_sets: Vec<vk::DescriptorSet>,
+    pub uniform_buffers: Vec<UniformBuffer>,
+
     pub image_available_semaphores: Vec<vk::Semaphore>,
     pub render_finished_semaphores: Vec<vk::Semaphore>,
     pub in_flight_fences: Vec<vk::Fence>,
@@ -173,6 +184,7 @@ struct Renderer {
     pub is_swapchain_dirty: bool,
 
     pub egui_renderer: Option<egui_ash_renderer::Renderer>,
+    pub start_time: std::time::Instant,
 }
 
 impl Drop for Renderer {
@@ -193,6 +205,16 @@ impl Drop for Renderer {
             }
 
             cleanup_swapchain(self);
+
+            for uniform_buffer in &mut self.uniform_buffers {
+                self.device.destroy_buffer(uniform_buffer.buffer, None);
+                uniform_buffer.allocation = None;
+            }
+
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
             self.allocator = None;
 
@@ -279,10 +301,28 @@ where
     )?;
     log::info!("Created swapchain");
 
-    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain)?;
-    log::info!("Created render pipeline and layout");
-
     const FRAMES_IN_FLIGHT: usize = 3;
+
+    let descriptor_set_layout = create_descriptor_set_layout(&device)?;
+    log::info!("Created descriptor set layout");
+
+    let uniform_buffers = create_uniform_buffers(&device, &allocator, FRAMES_IN_FLIGHT)?;
+    log::info!("Created uniform buffers");
+
+    let descriptor_pool = create_descriptor_pool(&device, FRAMES_IN_FLIGHT)?;
+    log::info!("Created descriptor pool");
+
+    let descriptor_sets = create_descriptor_sets(
+        &device,
+        descriptor_pool,
+        descriptor_set_layout,
+        &uniform_buffers,
+        FRAMES_IN_FLIGHT,
+    )?;
+    log::info!("Created descriptor sets");
+
+    let (pipeline_layout, pipeline) = create_pipeline(&device, &swapchain, descriptor_set_layout)?;
+    log::info!("Created render pipeline and layout");
 
     let egui_renderer = egui_ash_renderer::Renderer::with_gpu_allocator(
         allocator.clone(),
@@ -341,6 +381,10 @@ where
         pipeline,
         pipeline_layout,
         command_buffers: vec![],
+        descriptor_set_layout,
+        descriptor_pool,
+        descriptor_sets,
+        uniform_buffers,
         image_available_semaphores,
         render_finished_semaphores,
         in_flight_fences,
@@ -349,6 +393,7 @@ where
         frames_in_flight: FRAMES_IN_FLIGHT,
         is_swapchain_dirty: false,
         egui_renderer: Some(egui_renderer),
+        start_time: std::time::Instant::now(),
     };
     renderer.command_buffers = create_and_record_command_buffers(&renderer)?;
     log::info!("Created and recorded command buffers");
@@ -356,11 +401,123 @@ where
     Ok(renderer)
 }
 
+fn create_descriptor_set_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout, Box<dyn std::error::Error + 'static>> {
+    let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::VERTEX);
+
+    let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+        .bindings(std::slice::from_ref(&ubo_layout_binding));
+
+    let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&layout_info, None) }?;
+    Ok(descriptor_set_layout)
+}
+
+fn create_descriptor_pool(
+    device: &ash::Device,
+    frames_in_flight: usize,
+) -> Result<vk::DescriptorPool, Box<dyn std::error::Error + 'static>> {
+    let pool_size = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(frames_in_flight as u32);
+
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .pool_sizes(std::slice::from_ref(&pool_size))
+        .max_sets(frames_in_flight as u32);
+
+    let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+    Ok(descriptor_pool)
+}
+
+fn create_uniform_buffers(
+    device: &ash::Device,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    frames_in_flight: usize,
+) -> Result<Vec<UniformBuffer>, Box<dyn std::error::Error + 'static>> {
+    let buffer_size = std::mem::size_of::<glm::Mat4>() as u64;
+
+    let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
+
+    for _ in 0..frames_in_flight {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(buffer_size)
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+        let allocation =
+            allocator
+                .lock()
+                .unwrap()
+                .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                    name: "uniform buffer",
+                    requirements,
+                    location: gpu_allocator::MemoryLocation::CpuToGpu,
+                    linear: true,
+                    allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+                })?;
+
+        unsafe {
+            device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
+        }
+
+        uniform_buffers.push(UniformBuffer {
+            buffer,
+            allocation: Some(allocation),
+        });
+    }
+
+    Ok(uniform_buffers)
+}
+
+fn create_descriptor_sets(
+    device: &ash::Device,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    uniform_buffers: &[UniformBuffer],
+    frames_in_flight: usize,
+) -> Result<Vec<vk::DescriptorSet>, Box<dyn std::error::Error + 'static>> {
+    let layouts = vec![descriptor_set_layout; frames_in_flight];
+    let alloc_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&layouts);
+
+    let descriptor_sets = unsafe { device.allocate_descriptor_sets(&alloc_info) }?;
+
+    for (index, descriptor_set) in descriptor_sets.iter().enumerate() {
+        let buffer_info = vk::DescriptorBufferInfo::default()
+            .buffer(uniform_buffers[index].buffer)
+            .offset(0)
+            .range(std::mem::size_of::<glm::Mat4>() as u64);
+
+        let descriptor_write = vk::WriteDescriptorSet::default()
+            .dst_set(*descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(std::slice::from_ref(&buffer_info));
+
+        unsafe {
+            device.update_descriptor_sets(std::slice::from_ref(&descriptor_write), &[]);
+        }
+    }
+
+    Ok(descriptor_sets)
+}
+
 fn create_pipeline(
     device: &ash::Device,
     swapchain: &Swapchain,
+    descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error + 'static>> {
-    let layout_info = vk::PipelineLayoutCreateInfo::default();
+    let set_layouts = [descriptor_set_layout];
+    let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
     let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
     let entry_point_name = c"main";
     let vertex_source = read_shader(&include_bytes!("shaders/triangle.vert.spv")[..])?;
@@ -404,7 +561,7 @@ fn create_pipeline(
         .rasterizer_discard_enable(false)
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
-        .cull_mode(vk::CullModeFlags::BACK)
+        .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .depth_bias_enable(false)
         .depth_bias_constant_factor(0.0)
@@ -960,7 +1117,8 @@ fn recreate_swapchain(
     )?;
     log::info!("Recreated swapchain");
 
-    let (pipeline_layout, pipeline) = create_pipeline(&renderer.device, &swapchain)?;
+    let (pipeline_layout, pipeline) =
+        create_pipeline(&renderer.device, &swapchain, renderer.descriptor_set_layout)?;
     log::info!("Recreated render pipeline and layout");
 
     renderer.swapchain = swapchain;
@@ -976,10 +1134,45 @@ fn recreate_swapchain(
     Ok(())
 }
 
+fn update_uniform_buffer(
+    renderer: &Renderer,
+    current_frame: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let time = renderer.start_time.elapsed().as_secs_f32();
+
+    let model = glm::rotate(
+        &glm::Mat4::identity(),
+        time * glm::radians(&glm::vec1(45.0))[0],
+        &glm::vec3(0.0, 1.0, 0.0),
+    );
+
+    let view = glm::look_at(
+        &glm::vec3(0.0, 0.0, 3.0),
+        &glm::vec3(0.0, 0.0, 0.0),
+        &glm::vec3(0.0, 1.0, 0.0),
+    );
+
+    let aspect = renderer.swapchain.extent.width as f32 / renderer.swapchain.extent.height as f32;
+    let projection = glm::perspective(aspect, glm::radians(&glm::vec1(45.0))[0], 0.1, 100.0);
+
+    let mvp = projection * view * model;
+
+    if let Some(allocation) = &renderer.uniform_buffers[current_frame].allocation {
+        let data_ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut glm::Mat4;
+        unsafe {
+            *data_ptr = mvp;
+        }
+    }
+
+    Ok(())
+}
+
 fn render_frame(
     renderer: &mut Renderer,
     ui_frame_output: Option<(egui::FullOutput, Vec<egui::ClippedPrimitive>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    update_uniform_buffer(renderer, renderer.current_frame)?;
+
     let current_fence = renderer.in_flight_fences[renderer.current_frame];
     unsafe {
         renderer
@@ -1111,6 +1304,18 @@ fn render_frame(
             renderer.pipeline,
         )
     };
+
+    unsafe {
+        renderer.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            renderer.pipeline_layout,
+            0,
+            &[renderer.descriptor_sets[renderer.current_frame]],
+            &[],
+        )
+    };
+
     unsafe { renderer.device.cmd_draw(command_buffer, 3, 1, 0, 0) };
 
     if let Some(primitives) = clipped_primitives
