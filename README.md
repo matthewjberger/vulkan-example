@@ -4,6 +4,11 @@ This is an example of using rust, winit, vulkan, and egui together without using
 
 This uses Vulkan 1.3 with dynamic rendering, including the features needed for gpu-driven rendering
 
+> If you're looking for a Wgpu example, check out [the wgpu-example repo](https://github.com/matthewjberger/wgpu-example)
+>
+> If you're looking for an OpenGL example, check out [the opengl-example repo](https://github.com/matthewjberger/opengl-example)
+
+
 <img width="837" height="632" alt="vulkan" src="https://github.com/user-attachments/assets/001493e8-fa77-4eab-b621-baf455c1890b" />
 
 ## Quickstart
