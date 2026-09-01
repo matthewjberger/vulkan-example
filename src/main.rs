@@ -206,9 +206,14 @@ impl Drop for Renderer {
 
             cleanup_swapchain(self);
 
-            for uniform_buffer in &mut self.uniform_buffers {
-                self.device.destroy_buffer(uniform_buffer.buffer, None);
-                uniform_buffer.allocation = None;
+            if let Some(allocator) = self.allocator.as_ref() {
+                let mut allocator = allocator.lock().unwrap();
+                for uniform_buffer in &mut self.uniform_buffers {
+                    self.device.destroy_buffer(uniform_buffer.buffer, None);
+                    if let Some(allocation) = uniform_buffer.allocation.take() {
+                        let _ = allocator.free(allocation);
+                    }
+                }
             }
 
             self.device

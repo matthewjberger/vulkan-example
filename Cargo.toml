@@ -2,22 +2,23 @@
 name = "vulkan-example"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98.0"
 
 [dependencies]
 ash = "0.38.0"
 ash-window = "0.13.0"
-egui = "0.33.0"
-egui_extras = { version = "0.33.0", features = ["all_loaders"] }
+egui = "0.33.3"
+egui_extras = { version = "0.33.3", features = ["all_loaders"] }
 egui-ash-renderer = { version = "0.11.0", default-features = false, features = [
     "dynamic-rendering",
     "gpu-allocator",
 ] }
-egui-winit = "0.33.0"
-env_logger = "0.11.10"
+egui-winit = "0.33.3"
+env_logger = "0.11.11"
 gpu-allocator = { version = "0.28.0", features = [
     "vulkan",
 ], default-features = false }
-log = "0.4.29"
+log = "0.4.34"
 nalgebra-glm = "0.20.0"
 raw-window-handle = "0.6.2"
-winit = "0.30.12"
+winit = "0.30.13"
